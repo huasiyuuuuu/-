@@ -36,16 +36,92 @@
     clearSiteData: document.querySelector("#clearSiteData"),
     autoFillOnHover: document.querySelector("#autoFillOnHover"),
     overwriteExisting: document.querySelector("#overwriteExisting"),
-    message: document.querySelector("#message")
+    message: document.querySelector("#message"),
+    // Deep-clean dialog (injected by popup.html).
+    cleanDialog: document.querySelector("#cleanDialog"),
+    cleanDialogOrigins: document.querySelector("#cleanDialogOrigins"),
+    cleanDialogCancel: document.querySelector("#cleanDialogCancel"),
+    cleanDialogConfirm: document.querySelector("#cleanDialogConfirm"),
+    cleanDialogNote: document.querySelector("#cleanDialogNote")
   };
 
+  // ---- Structured banner ----------------------------------------------------
+
   function setMessage(text, kind = "") {
-    els.message.textContent = text || "";
-    if (!text) {
+    // Plain string path, kept for back-compat.
+    els.message.replaceChildren();
+    if (text === null || text === undefined || text === "") {
       els.message.removeAttribute("data-kind");
-    } else {
-      els.message.dataset.kind = kind || "info";
+      els.message.textContent = "";
+      return;
     }
+    els.message.dataset.kind = kind || "info";
+    els.message.textContent = text;
+  }
+
+  function renderBanner(lines, kind = "info") {
+    // `lines` is an array of either strings or { prefix, text } objects.
+    els.message.replaceChildren();
+    if (!lines || !lines.length) {
+      els.message.removeAttribute("data-kind");
+      return;
+    }
+    els.message.dataset.kind = kind;
+    for (const line of lines) {
+      const row = document.createElement("div");
+      row.className = "banner-line";
+      if (typeof line === "string") {
+        row.textContent = line;
+      } else {
+        if (line.prefix) {
+          const pre = document.createElement("span");
+          pre.className = "banner-prefix";
+          pre.textContent = line.prefix;
+          row.append(pre);
+        }
+        row.append(document.createTextNode(line.text || ""));
+      }
+      els.message.append(row);
+    }
+  }
+
+  /**
+   * Turns the structured `details` returned by content.js into a banner.
+   *   details.filled       — [{kind,label}, ...]
+   *   details.skipped      — [{kind,label,reason}, ...]
+   *   details.alreadyMatching — number
+   *   details.warnings     — string[]
+   */
+  function renderFillOutcome(details, opts = {}) {
+    if (!details || (!details.filled?.length && !details.skipped?.length && !details.alreadyMatching && !details.warnings?.length)) {
+      renderBanner([opts.emptyText || "没有找到可填字段（试试打开 \"覆盖已有字段\"）"], "warn");
+      return;
+    }
+    const lines = [];
+    let overall = "warn";
+
+    if (details.filled?.length) {
+      overall = "good";
+      const names = [...new Set(details.filled.map((f) => f.label))].join("、");
+      lines.push({ prefix: "✓", text: `已填 ${details.filled.length} 项：${names}` });
+    }
+
+    if (details.skipped?.length) {
+      const names = [...new Set(details.skipped.map((f) => f.label))].join("、");
+      lines.push({ prefix: "⚠", text: `跳过 ${details.skipped.length} 项已有值：${names}（勾 "覆盖已有字段" 可强填）` });
+      if (!details.filled?.length) overall = "warn";
+    }
+
+    if (details.alreadyMatching) {
+      lines.push({ prefix: "·", text: `${details.alreadyMatching} 项字段已匹配 vault，无需重填` });
+    }
+
+    if (details.warnings?.includes("multi-form")) {
+      lines.push({ prefix: "⚠", text: "发现多个账单表单，只填了第一个" });
+      if (!details.filled?.length) overall = "warn";
+    }
+
+    renderBanner(lines, overall);
   }
 
   function maskCard(number) {
@@ -135,6 +211,26 @@
     return vault.billings.find((item) => item.id === vault.settings.selectedBillingId) || vault.billings[0] || null;
   }
 
+  // ---- Clipboard helpers ---------------------------------------------------
+
+  /**
+   * Writes `text` to the clipboard then schedules a wipe after `ttlMs`. Before
+   * wiping we re-read the clipboard so we never clobber something the user
+   * copied since. Reading may require a gesture; if it fails we leave the
+   * clipboard alone, which is the safe default.
+   */
+  async function copyTransient(text, { ttlMs = 30000 } = {}) {
+    await navigator.clipboard.writeText(text);
+    setTimeout(async () => {
+      try {
+        const now = await navigator.clipboard.readText();
+        if (now === text) await navigator.clipboard.writeText("");
+      } catch {
+        // Silently ignore; see doc above.
+      }
+    }, ttlMs);
+  }
+
   async function copyText(value, label) {
     const text = String(value || "");
     if (!text) {
@@ -143,6 +239,21 @@
     }
     await navigator.clipboard.writeText(text);
     setMessage(`已复制 ${label}`, "good");
+  }
+
+  /**
+   * Sensitive-chip copy: same as copyText, but clears the clipboard after 30 s
+   * and tells the user so via the banner. Used for password / 2FA / SMS /
+   * recovery secrets.
+   */
+  async function copyTextTransient(value, label) {
+    const text = String(value || "");
+    if (!text) {
+      setMessage(`${label} 为空`, "bad");
+      return;
+    }
+    await copyTransient(text);
+    setMessage(`已复制 ${label}（30s 后自动清剪贴板）`, "good");
   }
 
   function csvCell(value) {
@@ -184,16 +295,22 @@
     setMessage(`已导出 CSV（${rows.length - 1} 条），可到 Google Password Manager 导入`, "good");
   }
 
-  function chip(label, value, action) {
+  /**
+   * A chip button. `sensitive` → copy-transient (30 s clipboard TTL).
+   */
+  function chip(label, value, options = {}) {
+    const { action, sensitive = false } = typeof options === "function" ? { action: options } : options;
     const button = document.createElement("button");
     button.type = "button";
     button.className = "chip";
+    if (sensitive) button.dataset.sensitive = "true";
     button.title = String(value || "");
     button.innerHTML = `<span class="chip-label"></span><span class="chip-value"></span>`;
     button.querySelector(".chip-label").textContent = `${label}`;
     button.querySelector(".chip-value").textContent = String(value || "");
     button.addEventListener("click", () => {
-      (action || (() => copyText(value, label)))().catch((error) => setMessage(error?.message || "复制失败", "bad"));
+      const defaultCopy = () => (sensitive ? copyTextTransient(value, label) : copyText(value, label));
+      (action || defaultCopy)().catch((error) => setMessage(error?.message || "复制失败", "bad"));
     });
     return button;
   }
@@ -353,15 +470,18 @@
     if (account) {
       const nodes = [
         chip("邮箱", account.email),
-        chip("密码", account.password),
+        chip("密码", account.password, { sensitive: true }),
         account.recoveryEmail ? chip("恢复", account.recoveryEmail) : null,
         account.year ? chip("年份", account.year) : null,
         account.country ? chip("国家", account.country) : null
       ];
       if (account.totpSecret) {
         const code = await totpCode(account.totpSecret);
-        nodes.push(chip("2FA", code, async () => copyText(await totpCode(account.totpSecret), "Gmail 2FA")));
-        nodes.push(chip("密钥", account.totpSecret));
+        nodes.push(chip("2FA", code, {
+          sensitive: true,
+          action: async () => copyTextTransient(await totpCode(account.totpSecret), "Gmail 2FA")
+        }));
+        nodes.push(chip("密钥", account.totpSecret, { sensitive: true }));
       }
       const badge = `${accounts.length} 条`;
       els.results.append(card(
@@ -381,12 +501,15 @@
     if (github) {
       const nodes = [
         chip("账号", github.username),
-        chip("密码", github.password)
+        chip("密码", github.password, { sensitive: true })
       ];
       if (github.totpSecret) {
         const code = await totpCode(github.totpSecret);
-        nodes.push(chip("2FA", code, async () => copyText(await totpCode(github.totpSecret), "GitHub 2FA")));
-        nodes.push(chip("密钥", github.totpSecret));
+        nodes.push(chip("2FA", code, {
+          sensitive: true,
+          action: async () => copyTextTransient(await totpCode(github.totpSecret), "GitHub 2FA")
+        }));
+        nodes.push(chip("密钥", github.totpSecret, { sensitive: true }));
       }
       els.results.append(card(
         "github",
@@ -404,18 +527,18 @@
     const billing = currentBilling();
     if (billing) {
       const nodes = [
-        billing.cardNumber ? chip("卡号", billing.cardNumber) : null,
+        billing.cardNumber ? chip("卡号", billing.cardNumber, { sensitive: true }) : null,
         billing.expiry ? chip("有效期", billing.expiry) : null,
         billing.expiryMonth ? chip("月", billing.expiryMonth) : null,
         billing.expiryYear ? chip("年", billing.expiryYear) : null,
-        billing.cvv ? chip("CVV", billing.cvv) : null,
+        billing.cvv ? chip("CVV", billing.cvv, { sensitive: true }) : null,
         billing.phone ? chip("电话", billing.phone) : null,
         billing.name ? chip("姓名", billing.name) : null,
         billing.addressLine1 ? chip("地址 1", billing.addressLine1) : null,
         billing.addressLine2 ? chip("地址 2", billing.addressLine2) : null,
         billing.address && !billing.addressLine1 ? chip("地址", billing.address) : null,
         billing.smsApi ? chip("接码 API", billing.smsApi) : null,
-        billing.smsApi ? chip("取短信码", "点击获取", () => getSmsCodeFor(billing)) : null
+        billing.smsApi ? chip("取短信码", "点击获取", { action: () => getSmsCodeFor(billing) }) : null
       ];
       const label = billing.cardNumber ? `账单 · ${maskCard(billing.cardNumber)}` : "账单";
       els.results.append(card(
@@ -512,11 +635,7 @@
       settings: vault.settings
     });
     if (!response?.ok) throw new Error(response?.error || "填充失败");
-    if (response.filled) {
-      setMessage(`已填充 ${response.filled} 个字段`, "good");
-    } else {
-      setMessage("没有找到可填字段（试试打开\"覆盖已有字段\"）", "warn");
-    }
+    renderFillOutcome(response.details);
   }
 
   async function fillAuto() {
@@ -586,18 +705,123 @@
     return [...origins].filter((origin) => /^https?:\/\//i.test(origin));
   }
 
+  /**
+   * Classifies origins into the current site (pre-checked by default) versus
+   * third-party SSO / payment bystanders (unchecked by default). Users who
+   * want to fully log out of Google along with Kiro need to opt in.
+   */
+  function classifyOrigins(origins, currentOrigin) {
+    const primary = [];
+    const thirdParty = [];
+    for (const origin of origins) {
+      if (origin === currentOrigin) primary.push(origin);
+      else thirdParty.push(origin);
+    }
+    return { primary, thirdParty };
+  }
+
+  /**
+   * Renders the confirm dialog and returns the selected origins, or null if
+   * the user cancelled. The confirm button is disabled for 500 ms to defeat
+   * accidental double-clicks.
+   */
+  function askCleanDialog(origins, currentOrigin) {
+    return new Promise((resolve) => {
+      const dialog = els.cleanDialog;
+      const list = els.cleanDialogOrigins;
+      if (!dialog?.showModal || !list) {
+        // Fallback if HTML hasn't been updated: plain confirm.
+        const ok = confirm(
+          `深度清理本地 Cookie / 缓存 / storage：\n${origins.join("\n")}\n\n` +
+          "注意：这只清除本机数据，不会让 Google 服务器端退出登录。页面会刷新。"
+        );
+        resolve(ok ? origins : null);
+        return;
+      }
+
+      const { primary, thirdParty } = classifyOrigins(origins, currentOrigin);
+      list.replaceChildren();
+
+      function addRow(origin, checked) {
+        const row = document.createElement("label");
+        row.className = "clean-row";
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.value = origin;
+        box.checked = checked;
+        const span = document.createElement("span");
+        span.textContent = origin;
+        row.append(box, span);
+        list.append(row);
+      }
+
+      if (primary.length) {
+        const header = document.createElement("div");
+        header.className = "clean-group-title";
+        header.textContent = "当前站点（默认清理）";
+        list.append(header);
+        primary.forEach((origin) => addRow(origin, true));
+      }
+
+      if (thirdParty.length) {
+        const header = document.createElement("div");
+        header.className = "clean-group-title";
+        header.textContent = "第三方（默认不清理，勾选后一起清）";
+        list.append(header);
+        thirdParty.forEach((origin) => addRow(origin, false));
+      }
+
+      // 500ms button-disabled guard against accidental double-clicks.
+      const confirmBtn = els.cleanDialogConfirm;
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = "确认清理（0.5s…）";
+      const unlockAt = Date.now() + 500;
+      const tick = () => {
+        const remaining = unlockAt - Date.now();
+        if (remaining > 0) {
+          confirmBtn.textContent = `确认清理（${(remaining / 1000).toFixed(1)}s…）`;
+          requestAnimationFrame(tick);
+        } else {
+          confirmBtn.disabled = false;
+          confirmBtn.textContent = "确认清理";
+        }
+      };
+      requestAnimationFrame(tick);
+
+      function cleanup(chosen) {
+        confirmBtn.removeEventListener("click", onConfirm);
+        els.cleanDialogCancel.removeEventListener("click", onCancel);
+        dialog.removeEventListener("close", onClose);
+        dialog.close();
+        resolve(chosen);
+      }
+      function onConfirm() {
+        const selected = [...list.querySelectorAll("input[type=checkbox]")]
+          .filter((box) => box.checked)
+          .map((box) => box.value);
+        if (!selected.length) { cleanup(null); return; }
+        cleanup(selected);
+      }
+      function onCancel() { cleanup(null); }
+      function onClose() { cleanup(null); }
+
+      confirmBtn.addEventListener("click", onConfirm);
+      els.cleanDialogCancel.addEventListener("click", onCancel);
+      dialog.addEventListener("close", onClose);
+      dialog.showModal();
+    });
+  }
+
   async function clearActiveSiteData() {
     const tab = await activeTab();
     if (!tab?.id) throw new Error("没有当前标签页");
+    const url = new URL(tab.url || "https://example.com");
     const origins = clearOriginsForTab(tab);
-    const confirmed = confirm(
-      `深度清理本地 Cookie / 缓存 / storage：\n${origins.join("\n")}\n\n` +
-      "注意：这只清除本机数据，不会让 Google 服务器端退出登录。页面会刷新。"
-    );
-    if (!confirmed) return;
-    const response = await chrome.runtime.sendMessage({ type: "clearSiteData", origins, tabId: tab.id, hard: true });
+    const chosen = await askCleanDialog(origins, url.origin);
+    if (!chosen || !chosen.length) return;
+    const response = await chrome.runtime.sendMessage({ type: "clearSiteData", origins: chosen, tabId: tab.id, hard: true });
     if (!response?.ok) throw new Error(response?.error || "清理失败");
-    setMessage("已深度清理本地站点记录", "good");
+    setMessage(`已深度清理 ${chosen.length} 个 origin（仅本地）`, "good");
   }
 
   async function getSmsCodeFor(billing) {
@@ -608,7 +832,8 @@
       if (!response?.ok) throw new Error(response?.error || "获取失败");
       const parsed = response.code ? response : parseSmsCode(response.raw || "");
       if (parsed.code) {
-        await copyText(parsed.code, "短信码");
+        await copyTransient(parsed.code);
+        setMessage(`已复制短信码（30s 后自动清剪贴板）`, "good");
         return parsed.code;
       }
       lastStatus = String(response.status || "");
@@ -620,17 +845,23 @@
   async function fetchAndFillSmsCode() {
     setMessage("正在获取短信码…", "");
     const code = await getSmsCodeFor(currentBilling());
-    setMessage(`验证码 ${code}（已复制）等待验证码输入框出现…`, "warn");
-    const totalFilled = await pollFillSmsCode(code);
-    if (totalFilled > 0) {
-      setMessage(`验证码 ${code} · 已填入 ${totalFilled} 个字段`, "good");
+    setMessage(`验证码 ${code}（已复制，30s 自动清）· 等待验证码输入框出现…`, "warn");
+    const result = await pollFillSmsCode(code);
+    if (result.details.filled?.length) {
+      renderFillOutcome(result.details, { emptyText: `验证码 ${code} 已复制，但 12 秒内未找到输入框，请手动粘贴` });
     } else {
-      setMessage(`验证码 ${code} 已复制，12 秒内未找到输入框，请手动粘贴`, "warn");
+      renderBanner(
+        [
+          { prefix: "⚠", text: `验证码 ${code} 已复制，12 秒内未找到输入框，请手动粘贴` },
+          { prefix: "·", text: "剪贴板 30 秒后自动清空" }
+        ],
+        "warn"
+      );
     }
   }
 
   async function pollFillSmsCode(code, { attempts = 12, intervalMs = 1000 } = {}) {
-    let total = 0;
+    let details = { filled: [], skipped: [], alreadyMatching: 0, warnings: [] };
     for (let i = 0; i < attempts; i += 1) {
       const response = await sendToAllFrames({
         type: "fillFromPopup",
@@ -638,14 +869,11 @@
         code,
         settings: { ...vault.settings, overwriteExisting: true }
       }).catch(() => null);
-      const filled = Number(response?.filled) || 0;
-      if (filled > 0) {
-        total = filled;
-        break;
-      }
+      if (response?.details) details = response.details;
+      if ((details.filled?.length || 0) > 0) break;
       if (i < attempts - 1) await new Promise((resolve) => setTimeout(resolve, intervalMs));
     }
-    return total;
+    return { details };
   }
 
   els.quickImport.addEventListener("input", () => {

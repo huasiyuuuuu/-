@@ -128,6 +128,9 @@ class MockInput {
     this.readOnly = false;
     this.events = [];
     this._value = attrs.value || "";
+    // Optional: a sentinel form reference so multi-form tests can pretend this
+    // field lives inside a specific <form>. closest("form") returns it.
+    this._form = attrs.form || null;
   }
 
   getAttribute(name) {
@@ -137,7 +140,16 @@ class MockInput {
   closest(selector) {
     if (selector === "[class]") return { innerText: this.parentText };
     if (selector === "label") return null;
+    if (selector === "form") return this._form;
+    if (selector === "[role='form']") return null;
     return null;
+  }
+
+  querySelectorAll(_selector) {
+    // Used when content.js scopes to a form; the mock "form" object has its own
+    // querySelectorAll that the test wires up. Plain inputs never become the
+    // scope root, so this is a no-op.
+    return [];
   }
 
   getBoundingClientRect() {
@@ -166,7 +178,7 @@ Object.defineProperty(MockInput.prototype, "value", {
   }
 });
 
-function createContentSandbox(fields) {
+function createContentSandbox(fields, options = {}) {
   const listeners = [];
   const storageListeners = [];
   const body = {
@@ -174,6 +186,10 @@ function createContentSandbox(fields) {
     closest: () => null,
     innerText: ""
   };
+  // When tests pass `options.billingFields` we also respond to the specific
+  // selectors that content.js's billingFormScopes() uses to discover
+  // card-number-bearing forms. Otherwise we just return the generic list.
+  const billingSelectorRe = /cc-number|card.*number|cardnumber|cc-csc|cc-exp/i;
   const documentMock = {
     body,
     documentElement: {
@@ -195,7 +211,12 @@ function createContentSandbox(fields) {
       getBoundingClientRect: () => ({ width: 120, height: 36, left: 0, top: 0 })
     }),
     querySelector: () => null,
-    querySelectorAll: () => fields,
+    querySelectorAll: (selector) => {
+      if (options.billingFields && billingSelectorRe.test(String(selector || ""))) {
+        return options.billingFields;
+      }
+      return fields;
+    },
     addEventListener: () => {}
   };
   const sandbox = createSharedSandbox({
@@ -413,7 +434,8 @@ async function runOtpFillAudit() {
     assert(fields[0].events.includes("beforeinput"), "beforeinput event was not dispatched", fields[0].events);
   }
 
-  // Segmented: 6 x maxlength=1, numeric inputmode. Each box gets one char.
+  // Segmented: 6 x maxlength=1, numeric inputmode. Each box gets one char;
+  // structured details report it as a single logical fill ("验证码（N 格）").
   {
     const fields = Array.from({ length: 6 }, () => new MockInput({ maxlength: "1", inputmode: "numeric", type: "tel" }, "Enter the 6-digit code"));
     const { listeners } = createContentSandbox(fields);
@@ -423,7 +445,9 @@ async function runOtpFillAudit() {
       code: "493812",
       settings: {}
     });
-    assert(r.filled === 6, "Segmented OTP should report 6 fills", r);
+    assert(r.filled === 1, "Segmented OTP should report as 1 logical fill", r);
+    assert(Array.isArray(r.details?.filled) && r.details.filled[0]?.kind === "otp", "Segmented OTP details.filled shape wrong", r.details);
+    assert(/6 格/.test(r.details.filled[0].label), "Segmented OTP label should mention 格 count", r.details.filled[0]);
     assert(fields.map((field) => field.value).join("") === "493812", "Segmented OTP values wrong", fields.map((field) => field.value));
     // The last filled box must have blurred (we call blur() at the end).
     assert(fields[5].events.includes("blur"), "Segmented OTP should blur the last box", fields[5].events);
@@ -446,6 +470,121 @@ async function runOtpFillAudit() {
     assert(r.filled === 1 && full.value === "493812", "Full OTP box should be preferred over segmented", { r, full: full.value, segmented: segmented.map((s) => s.value) });
     // Segmented boxes stay empty.
     assert(segmented.every((s) => s.value === ""), "Segmented boxes must not be touched when a single box wins", segmented.map((s) => s.value));
+  }
+}
+
+// New: structured {filled[], skipped[], alreadyMatching, warnings} contract.
+async function runStructuredDetailsAudit(billing) {
+  // Case 1: empty page, fresh fill — details.filled carries {kind,label} objects
+  // with a label that's a user-facing string.
+  {
+    const fields = [
+      new MockInput({ autocomplete: "cc-number" }),
+      new MockInput({ autocomplete: "cc-csc" }),
+      new MockInput({ autocomplete: "cc-name" })
+    ];
+    const { listeners } = createContentSandbox(fields);
+    const r = await sendContentMessage(listeners[0], {
+      type: "fillFromPopup",
+      kind: "billing",
+      billing,
+      settings: {}
+    });
+    assert(r.details, "Response must carry details object", r);
+    assert(Array.isArray(r.details.filled), "details.filled must be an array", r.details);
+    assert(r.details.filled.every((item) => typeof item.kind === "string" && typeof item.label === "string"),
+      "Every filled entry must be {kind:string, label:string}", r.details.filled);
+    assert(r.details.filled.some((item) => item.kind === "cardNumber"), "cardNumber should appear in filled", r.details.filled);
+    assert(r.details.filled.some((item) => item.label === "CVV"), "CVV label should be human-readable", r.details.filled);
+    assert(Array.isArray(r.details.skipped) && r.details.skipped.length === 0, "skipped empty on empty page", r.details);
+    assert(r.details.alreadyMatching === 0, "alreadyMatching=0 on first pass", r.details);
+    assert(Array.isArray(r.details.warnings), "warnings must be an array", r.details);
+    // Legacy filled mirrors details.filled.length.
+    assert(r.filled === r.details.filled.length, "Legacy filled count must match details.filled.length", r);
+  }
+
+  // Case 2: second fill against the just-filled fields — everything matches, so
+  // filled=0, alreadyMatching > 0, no skipped (identical values aren't skipped,
+  // they're "alreadyMatching"). This is the "why did nothing happen?" case.
+  {
+    const fields = [
+      new MockInput({ autocomplete: "cc-number", value: "4242424242424242" }),
+      new MockInput({ autocomplete: "cc-csc", value: "051" }),
+      new MockInput({ autocomplete: "cc-name", value: "TEST USER" })
+    ];
+    const { listeners } = createContentSandbox(fields);
+    const r = await sendContentMessage(listeners[0], {
+      type: "fillFromPopup",
+      kind: "billing",
+      billing,
+      settings: {}
+    });
+    assert(r.details.filled.length === 0, "Nothing should be filled when all values already match", r.details);
+    assert(r.details.skipped.length === 0, "Identical values are alreadyMatching, not skipped", r.details);
+    assert(r.details.alreadyMatching >= 3, "Three fields should each contribute 1 to alreadyMatching", r.details);
+  }
+
+  // Case 3: field holds a DIFFERENT value and user didn't opt in to overwrite.
+  // Expect it to land in `skipped` with reason="has-value", not silently dropped.
+  {
+    const fields = [new MockInput({ autocomplete: "cc-name", value: "OLD HOLDER" })];
+    const { listeners } = createContentSandbox(fields);
+    const r = await sendContentMessage(listeners[0], {
+      type: "fillFromPopup",
+      kind: "billing",
+      billing,
+      settings: { overwriteExisting: false }
+    });
+    assert(r.details.filled.length === 0, "Name must not be overwritten without user opt-in", r.details);
+    const entry = r.details.skipped.find((item) => item.kind === "name");
+    assert(entry && entry.reason === "has-value", "skipped[] must record {kind:'name', reason:'has-value'}", r.details);
+    assert(fields[0].value === "OLD HOLDER", "Existing name must be preserved", fields[0].value);
+  }
+
+  // Case 4: billingFormScopes() picks a single form. When two billing forms
+  // exist, details.warnings includes 'multi-form' and only the first form's
+  // fields are filled. The audit wires up a fake "current billing form" +
+  // "secondary billing form" via the options.billingFields hook.
+  {
+    const formA = {
+      querySelectorAll: () => formA.fields,
+      fields: [
+        new MockInput({ autocomplete: "cc-number" }),
+        new MockInput({ autocomplete: "cc-csc" })
+      ]
+    };
+    const formB = {
+      querySelectorAll: () => formB.fields,
+      fields: [
+        new MockInput({ autocomplete: "cc-number" }),
+        new MockInput({ autocomplete: "cc-csc" })
+      ]
+    };
+    // Link each field's closest("form") back to its parent form.
+    for (const field of formA.fields) field._form = formA;
+    for (const field of formB.fields) field._form = formB;
+
+    // billingFormScopes() does a single document.querySelectorAll across all
+    // billing-selectors; we feed it fields from BOTH forms. When the scope is
+    // later picked (formA), content.js calls fieldsNear(formA) which falls
+    // through to formA.querySelectorAll().
+    const allBillingFields = [...formA.fields, ...formB.fields];
+    // The generic field walk (when no form is picked) also sees everything —
+    // but after the multi-form branch, only formA is walked.
+    const { listeners } = createContentSandbox(allBillingFields, { billingFields: allBillingFields });
+    const r = await sendContentMessage(listeners[0], {
+      type: "fillFromPopup",
+      kind: "billing",
+      billing,
+      settings: {}
+    });
+    assert(r.details.warnings.includes("multi-form"),
+      "Multi-form page must emit warnings:['multi-form']", r.details);
+    // Only formA was filled; formB's cc-number stays empty.
+    assert(formA.fields[0].value === "4242424242424242",
+      "First billing form should be filled", formA.fields[0].value);
+    assert(formB.fields[0].value === "",
+      "Secondary billing form must be left alone", formB.fields[0].value);
   }
 }
 
@@ -521,7 +660,7 @@ async function runBackgroundVaultPrecedenceAudit() {
 
 function runManifestAudit() {
   const manifest = JSON.parse(read("manifest.json"));
-  assert(manifest.version === "0.1.6", "Manifest version mismatch", manifest.version);
+  assert(manifest.version === "0.1.7", "Manifest version mismatch", manifest.version);
   assert(manifest.permissions.includes("webNavigation"), "webNavigation permission missing", manifest.permissions);
   // The `scripting` permission was removed along with the dead execution path in
   // the encrypted-vault cleanup. Guard against it creeping back.
@@ -552,6 +691,7 @@ async function main() {
   await runContentAudit(parsed.billing);
   await runOverwritePolicyAudit(parsed.billing);
   await runOtpFillAudit();
+  await runStructuredDetailsAudit(parsed.billing);
   await runBackgroundVaultPrecedenceAudit();
   console.log("AUDIT PASS");
 }
