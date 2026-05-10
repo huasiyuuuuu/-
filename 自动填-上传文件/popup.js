@@ -32,6 +32,7 @@
     exportGoogleCsv: document.querySelector("#exportGoogleCsv"),
     clearSiteData: document.querySelector("#clearSiteData"),
     autoFillOnHover: document.querySelector("#autoFillOnHover"),
+    overwriteExisting: document.querySelector("#overwriteExisting"),
     message: document.querySelector("#message")
   };
 
@@ -236,6 +237,7 @@
   async function renderResults() {
     els.results.replaceChildren();
     els.autoFillOnHover.checked = vault.settings.autoFillOnHover !== false;
+    els.overwriteExisting.checked = vault.settings.overwriteExisting === true;
 
     const accounts = vault.accounts;
     const githubs = vault.githubs;
@@ -511,14 +513,34 @@
   }
 
   async function fetchAndFillSmsCode() {
+    setMessage("正在获取短信码…", "");
     const code = await getSmsCodeFor(currentBilling());
-    const response = await sendToAllFrames({
-      type: "fillFromPopup",
-      kind: "smsCode",
-      code,
-      settings: { ...vault.settings, overwriteExisting: true }
-    });
-    setMessage(response?.filled ? `验证码已复制并填入 ${response.filled} 个字段` : "验证码已复制，但当前页没有找到验证码输入框", response?.filled ? "good" : "");
+    setMessage(`验证码 ${code}（已复制）等待验证码输入框出现…`, "");
+    const totalFilled = await pollFillSmsCode(code);
+    if (totalFilled > 0) {
+      setMessage(`验证码 ${code} 已填入 ${totalFilled} 个字段`, "good");
+    } else {
+      setMessage(`验证码 ${code} 已复制，但 12 秒内没有找到验证码输入框，请手动粘贴`, "bad");
+    }
+  }
+
+  async function pollFillSmsCode(code, { attempts = 12, intervalMs = 1000 } = {}) {
+    let total = 0;
+    for (let i = 0; i < attempts; i += 1) {
+      const response = await sendToAllFrames({
+        type: "fillFromPopup",
+        kind: "smsCode",
+        code,
+        settings: { ...vault.settings, overwriteExisting: true }
+      }).catch(() => null);
+      const filled = Number(response?.filled) || 0;
+      if (filled > 0) {
+        total = filled;
+        break;
+      }
+      if (i < attempts - 1) await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    return total;
   }
 
   els.quickImport.addEventListener("input", () => {
@@ -578,6 +600,17 @@
     vault.settings.autoFillOnHover = els.autoFillOnHover.checked;
     await saveVault();
     await render();
+  });
+
+  els.overwriteExisting.addEventListener("change", async () => {
+    vault.settings.overwriteExisting = els.overwriteExisting.checked;
+    await saveVault();
+    setMessage(
+      els.overwriteExisting.checked
+        ? "已开启：下次填充会覆盖页面已有字段"
+        : "已关闭：仅在字段为空或残留掩码时填充",
+      "good"
+    );
   });
 
   loadVault()

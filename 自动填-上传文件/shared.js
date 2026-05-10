@@ -622,7 +622,17 @@
     if (/cc-exp-year|expir.*year|年份|有效期年/.test(text)) return "expiryYear";
     if (/cc-exp|expiry|expiration|exp date|valid thru|有效期/.test(text)) return "expiry";
     if (/cc-csc|cvc|cvv|security code|安全码/.test(text)) return "cvv";
-    if (/totp|otp|one[-\s]?time|one[-\s]?time code|authenticator|verification|verify code|login code|enter code|验证码|校验码|动态码/.test(text)) return "otp";
+    if (/totp|otp|one[-\s]?time|one[-\s]?time code|authenticator|verification|verify code|login code|enter code|passcode|sms\s*code|text\s*code|auth\s*code|验证码|校验码|动态码|短信码|一次性密码|两步验证|安全码验证/.test(text)) return "otp";
+    // Standalone "code" heuristic + numeric-short inputmode fallback. Excludes zip/postal/promo/coupon/country/area/etc.
+    // Helps on 3DS / bank challenge pages where the field is just labelled "Code".
+    if (
+      /\bcode\b/.test(text)
+      && !/(zip|postal|post\s*code|promo|coupon|discount|referral|country|area|dial|product|voucher|gift|store|tracking|ref(?:erence)?\s*code|invite|invitation)/.test(text)
+    ) return "otp";
+    const maxLenAttr = Number(element.getAttribute("maxlength") || 0);
+    const inputmodeAttr = (element.getAttribute("inputmode") || "").toLowerCase();
+    // maxlength 6-8 + numeric inputmode is a very strong OTP signal (avoid CVV's 3-4).
+    if ((inputmodeAttr === "numeric" || inputmodeAttr === "decimal") && maxLenAttr >= 6 && maxLenAttr <= 8) return "otp";
     if (/cc-name|cardholder|name on card|holder name|持卡人|姓名/.test(text)) return "name";
     if (/tel|phone|mobile|手机号|电话/.test(text) || type === "tel") return "phone";
     if (/postal|zip|postcode|邮编/.test(text)) return "postal";

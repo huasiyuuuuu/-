@@ -90,6 +90,13 @@
 
     const prototype = element.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+    // Fire a beforeinput first; some React/Stripe internal handlers rely on it to
+    // transition state. Swallowing it is fine -- we still write the value afterwards.
+    try {
+      element.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: text }));
+    } catch {
+      // Older browsers may not support InputEvent('beforeinput', …). Safe to ignore.
+    }
     if (descriptor?.set) descriptor.set.call(element, text);
     else element.value = text;
     element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
@@ -111,13 +118,44 @@
     return String(value || "").replace(/\D/g, "");
   }
 
+  // Characters banks/Stripe use to show a "masked" or placeholder value. Treat them as empty
+  // so "•••• 4242" / "XXXX" / "****" don't block a fresh fill.
+  const MASK_STRIP = /[\s•·●○◦\u2022*xX_\-—–]/g;
+
+  function effectivelyEmpty(text) {
+    if (!text) return true;
+    const stripped = String(text).replace(MASK_STRIP, "");
+    if (!stripped) return true;
+    // "xxxx" style placeholders stripped already; also treat a short digit-run that's clearly
+    // a masked tail (e.g. just "4242") as partial, not "already filled".
+    return false;
+  }
+
   function shouldSetValue(field, value, settings, kind = "") {
     if (value == null || value === "") return false;
-    if (settings?.overwriteExisting) return true;
     const currentText = String(field.isContentEditable ? field.textContent : field.value || "").trim();
-    if (!currentText) return true;
-    if (kind === "expiry") return digits(currentText).length < 4;
-    if (kind === "expiryYear") return digits(currentText).length < 2;
+
+    // Empty or looks masked -> always fill.
+    if (effectivelyEmpty(currentText)) return true;
+
+    // Same value already present -> no write (but the caller may still want to re-dispatch events).
+    if (currentText === String(value)) return false;
+
+    // User opted in to overwrite.
+    if (settings?.overwriteExisting) return true;
+
+    // Smart overwrite: if the incoming value is "more complete" than what's already there,
+    // we replace it. This is what saves the Stripe case where a partially-typed or
+    // browser-autofilled card is blocking the real fill.
+    const newDigits = digits(value).length;
+    const curDigits = digits(currentText).length;
+    if (kind === "cardNumber") return curDigits < newDigits;
+    if (kind === "cvv") return curDigits < newDigits;
+    if (kind === "expiry") return curDigits < 4;
+    if (kind === "expiryMonth") return curDigits < 2;
+    if (kind === "expiryYear") return curDigits < 2;
+    if (kind === "otp") return curDigits < newDigits;
+    if (kind === "postal") return curDigits < newDigits;
     return false;
   }
 
@@ -158,12 +196,73 @@
     return filled;
   }
 
+  function findSegmentedOtpGroup(fields, requiredLen) {
+    // Pick contiguous (in DOM order) single-char number-like inputs that are likely
+    // the boxes of a segmented OTP widget (GitHub recovery / many 3DS challenge pages).
+    const cand = fields.filter((field) => {
+      if (!field || field.tagName !== "INPUT") return false;
+      const maxlen = Number(field.getAttribute("maxlength") || 0);
+      if (maxlen !== 1) return false;
+      const type = (field.getAttribute("type") || "").toLowerCase();
+      const inputmode = (field.getAttribute("inputmode") || "").toLowerCase();
+      if (type === "password" || type === "checkbox" || type === "radio" || type === "hidden") return false;
+      if (type && !["text", "tel", "number", "search", ""].includes(type)) return false;
+      return !inputmode || inputmode === "numeric" || inputmode === "decimal" || inputmode === "text";
+    });
+    if (cand.length < Math.min(requiredLen, 4)) return null;
+    // Only take as many as we need so we don't accidentally fill a whole row of
+    // unrelated 1-char inputs.
+    return cand.slice(0, Math.min(cand.length, Math.max(requiredLen, 4)));
+  }
+
+  function fillSegmentedOtp(boxes, code) {
+    const chars = String(code || "").split("");
+    if (!boxes || !chars.length) return 0;
+    let filled = 0;
+    for (let i = 0; i < boxes.length && i < chars.length; i += 1) {
+      const box = boxes[i];
+      try { box.focus?.(); } catch { /* focus may throw in certain frames */ }
+      if (setNativeValue(box, chars[i])) filled += 1;
+      // Some implementations advance focus only on keydown/keyup. Fire synthetic ones.
+      try {
+        box.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: chars[i] }));
+        box.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: chars[i] }));
+      } catch {
+        // KeyboardEvent may be unavailable in stripped environments (audit mock).
+      }
+    }
+    try { boxes[Math.min(chars.length, boxes.length) - 1]?.blur?.(); } catch { /* ignore */ }
+    return filled;
+  }
+
   function fillOtpCode(target, code, settings = {}) {
     if (!code) return 0;
+    const fields = fieldsNear(target || document.body);
+    const otpFields = fields.filter((field) => inferFieldType(field) === "otp");
+
+    // Prefer the single "enter the whole code" box when available.
+    const singleBox = otpFields.find((field) => Number(field.getAttribute("maxlength") || 0) !== 1);
+    if (singleBox) {
+      try { singleBox.focus?.(); } catch { /* ignore */ }
+      if (shouldSetValue(singleBox, code, settings, "otp") && setNativeValue(singleBox, code)) {
+        try { singleBox.blur?.(); } catch { /* ignore */ }
+        return 1;
+      }
+    }
+
+    // Fall back to segmented inputs. Use the explicit otp-typed ones first; if
+    // we still don't have enough, try all visible fields (some sites don't mark
+    // the boxes with aria/code keywords at all).
+    const segmentedOtp = otpFields.filter((field) => Number(field.getAttribute("maxlength") || 0) === 1);
+    let boxes = segmentedOtp.length >= Math.min(code.length, 4) ? segmentedOtp : findSegmentedOtpGroup(fields, code.length);
+    if (boxes && boxes.length >= Math.min(code.length, 4)) {
+      return fillSegmentedOtp(boxes, code);
+    }
+
+    // Last resort: write the whole code into each otp-typed box we saw.
     let filled = 0;
-    for (const field of fieldsNear(target || document.body)) {
-      const kind = inferFieldType(field);
-      if (kind === "otp" && shouldSetValue(field, code, settings, "otp") && setNativeValue(field, code)) filled += 1;
+    for (const field of otpFields) {
+      if (shouldSetValue(field, code, settings, "otp") && setNativeValue(field, code)) filled += 1;
     }
     return filled;
   }
@@ -313,7 +412,7 @@
             type: "fillFromPopup",
             kind: "billing",
             billing,
-            settings: { ...settings, overwriteExisting: false }
+            settings
           }
         });
         return response?.filled || 0;
@@ -431,16 +530,24 @@
       }
       if (!code) throw new Error("SMS API returned no code");
       await navigator.clipboard.writeText(code);
-      const fillResponse = await chrome.runtime.sendMessage({
-        type: "fillAllFrames",
-        payload: {
-          type: "fillFromPopup",
-          kind: "smsCode",
-          code,
-          settings: { ...settings, overwriteExisting: true }
-        }
-      });
-      const filled = fillResponse?.filled || 0;
+      showToast(`SMS ${code} · waiting for input…`);
+      // The 3DS / challenge iframe often mounts only after the user hits "Pay".
+      // Poll for ~12s so the user can open the challenge and we'll still fill.
+      let filled = 0;
+      for (let i = 0; i < 12; i += 1) {
+        const fillResponse = await chrome.runtime.sendMessage({
+          type: "fillAllFrames",
+          payload: {
+            type: "fillFromPopup",
+            kind: "smsCode",
+            code,
+            settings: { ...settings, overwriteExisting: true }
+          }
+        }).catch(() => null);
+        filled = Number(fillResponse?.filled) || 0;
+        if (filled > 0) break;
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
       showToast(filled ? `SMS code filled: ${filled}` : `SMS code copied: ${code}`);
       return filled;
     });
@@ -498,7 +605,7 @@
         showToast(filled ? `Filled GitHub: ${filled}` : "No GitHub fields found");
       }, context.isGithubLogin),
       dockButton("Billing", async () => {
-        const filled = await withVault(({ settings, billing }) => fillBilling(document.body, billing, { ...settings, overwriteExisting: false }));
+        const filled = await withVault(({ settings, billing }) => fillBilling(document.body, billing, settings));
         showToast(filled ? `Filled billing: ${filled}` : "No billing fields found");
       }, context.isPayment),
       dockButton("Copy 2FA", async () => {
@@ -591,12 +698,12 @@
         let filled = 0;
         if (message.kind === "account") filled = await fillAccount(document.body, message.account, message.settings);
         if (message.kind === "github") filled = await fillAccount(document.body, message.github, message.settings);
-        if (message.kind === "billing") filled = fillBilling(document.body, message.billing, { ...message.settings, overwriteExisting: false });
+        if (message.kind === "billing") filled = fillBilling(document.body, message.billing, message.settings);
         if (message.kind === "smsCode") filled = fillOtpCode(document.body, message.code, { ...message.settings, overwriteExisting: true });
         if (message.kind === "both") {
           const preferGithub = /(^|\.)github\.com$/i.test(location.hostname);
           filled = await fillAccount(document.body, preferGithub ? message.github || message.account : message.account, message.settings);
-          filled += fillBilling(document.body, message.billing, { ...message.settings, overwriteExisting: false });
+          filled += fillBilling(document.body, message.billing, message.settings);
         }
         if (filled) showToast(`Filled ${filled} fields`);
         sendResponse({ ok: true, filled });
