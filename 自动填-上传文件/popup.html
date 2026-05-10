@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>账号填充助手</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="app">
+      <header class="topbar">
+        <div>
+          <h1>账号填充助手</h1>
+          <p id="statusText">粘贴后自动识别，点标签复制；网页里点悬浮按钮才填充。</p>
+        </div>
+      </header>
+
+      <section class="panel">
+        <label class="field">
+          <span>粘贴卡密 / 账号 / 账单文本</span>
+          <textarea id="quickImport" rows="5" spellcheck="false" placeholder="Gmail: email|password|recovery|2FA|year|country&#10;GitHub: username----password----2FA&#10;账单: 直接粘贴页面文本"></textarea>
+        </label>
+        <div class="grid">
+          <button id="pasteImport" class="primary" type="button">读取剪贴板并识别</button>
+          <button id="clearImport" type="button">清空</button>
+        </div>
+        <p id="message" class="message" role="status"></p>
+      </section>
+
+      <section class="panel compact">
+        <div id="results" class="results"></div>
+      </section>
+
+      <section class="panel compact">
+        <div class="grid">
+          <button id="fillAuto" class="primary" type="button">一键填当前页</button>
+          <button id="fillBilling" type="button">填账单</button>
+          <button id="fillSmsCode" type="button">取并填验证码</button>
+          <button id="openKiroHome" type="button">打开 Kiro</button>
+          <button id="capturePage" type="button">识别当前页</button>
+          <button id="saveFolder" type="button">保存到文件夹</button>
+          <button id="exportGoogleCsv" type="button">导出密码 CSV</button>
+          <button id="clearSiteData" type="button">深度清理站点</button>
+        </div>
+        <label class="toggle"><input id="autoFillOnHover" type="checkbox">在支持页面显示右侧悬浮填充按钮</label>
+      </section>
+    </main>
+
+    <script src="shared.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

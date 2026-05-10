@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "\u8d26\u53f7\u586b\u5145\u6e05\u6d17\u52a9\u624b",
+  "description": "Paste-to-tags autofill helper for Google login, GitHub, Kiro, and Stripe payment pages.",
+  "version": "0.1.5",
+  "action": {
+    "default_title": "\u8d26\u53f7\u586b\u5145\u6e05\u6d17\u52a9\u624b",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "activeTab",
+    "browsingData",
+    "clipboardRead",
+    "clipboardWrite",
+    "storage",
+    "scripting",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:37621/*",
+    "http://localhost:37621/*",
+    "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://accounts.google.com/*",
+        "https://github.com/*",
+        "https://kiro.dev/*",
+        "https://*.kiro.dev/*",
+        "https://*.stripe.com/*",
+        "https://*.stripe.network/*"
+      ],
+      "js": [
+        "shared.js",
+        "content.js"
+      ],
+      "css": [
+        "content.css"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}
