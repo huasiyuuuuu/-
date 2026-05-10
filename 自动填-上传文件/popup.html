@@ -11,38 +11,55 @@
       <header class="topbar">
         <div>
           <h1>账号填充助手</h1>
-          <p id="statusText">粘贴后自动识别，点标签复制；网页里点悬浮按钮才填充。</p>
+          <p id="statusText">粘贴后自动识别；在网页上点 Fill 或用下面的按钮填入。</p>
         </div>
       </header>
 
       <section class="panel">
         <label class="field">
           <span>粘贴卡密 / 账号 / 账单文本</span>
-          <textarea id="quickImport" rows="5" spellcheck="false" placeholder="Gmail: email|password|recovery|2FA|year|country&#10;GitHub: username----password----2FA&#10;账单: 直接粘贴页面文本"></textarea>
+          <textarea id="quickImport" rows="4" spellcheck="false"
+            placeholder="Gmail: email|password|recovery|2FA|year|country
+GitHub: username----password----2FA
+账单: 直接粘贴页面文本"></textarea>
         </label>
-        <div class="grid">
-          <button id="pasteImport" class="primary" type="button">读取剪贴板并识别</button>
-          <button id="clearImport" type="button">清空</button>
+        <div class="row-2">
+          <button id="pasteImport" type="button">读剪贴板并识别</button>
+          <button id="clearImport" type="button" class="ghost">清空</button>
         </div>
-        <p id="message" class="message" role="status"></p>
+        <div id="message" class="banner" role="status"></div>
       </section>
 
-      <section class="panel compact">
-        <div id="results" class="results"></div>
-      </section>
+      <section id="results" class="results" aria-label="识别结果"></section>
 
-      <section class="panel compact">
-        <div class="grid">
-          <button id="fillAuto" class="primary" type="button">一键填当前页</button>
+      <section class="panel actions">
+        <button id="fillAuto" class="primary hero" type="button">一键填当前页</button>
+        <div class="row-2">
           <button id="fillBilling" type="button">填账单</button>
           <button id="fillSmsCode" type="button">取并填验证码</button>
-          <button id="openKiroHome" type="button">打开 Kiro</button>
-          <button id="capturePage" type="button">识别当前页</button>
-          <button id="saveFolder" type="button">保存到文件夹</button>
-          <button id="exportGoogleCsv" type="button">导出密码 CSV</button>
-          <button id="clearSiteData" type="button">深度清理站点</button>
         </div>
-        <label class="toggle"><input id="autoFillOnHover" type="checkbox">在支持页面显示右侧悬浮填充按钮</label>
+
+        <details class="more">
+          <summary>更多工具</summary>
+          <div class="row-2">
+            <button id="capturePage" type="button">识别当前页</button>
+            <button id="openKiroHome" type="button">打开 Kiro</button>
+            <button id="saveFolder" type="button">保存到文件夹</button>
+            <button id="exportGoogleCsv" type="button">导出密码 CSV</button>
+          </div>
+          <button id="clearSiteData" type="button" class="danger">深度清理当前站点</button>
+        </details>
+
+        <div class="settings">
+          <label class="toggle">
+            <input id="autoFillOnHover" type="checkbox">
+            <span>在支持页面显示右侧悬浮 Fill 按钮</span>
+          </label>
+          <label class="toggle">
+            <input id="overwriteExisting" type="checkbox">
+            <span>覆盖已有字段（治"填不进去"）</span>
+          </label>
+        </div>
       </section>
     </main>
 

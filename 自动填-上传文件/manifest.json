@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
-  "name": "\u8d26\u53f7\u586b\u5145\u6e05\u6d17\u52a9\u624b",
+  "name": "账号填充清洗助手",
   "description": "Paste-to-tags autofill helper for Google login, GitHub, Kiro, and Stripe payment pages.",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "action": {
-    "default_title": "\u8d26\u53f7\u586b\u5145\u6e05\u6d17\u52a9\u624b",
+    "default_title": "账号填充清洗助手",
     "default_popup": "popup.html"
   },
   "background": {
@@ -16,13 +16,19 @@
     "clipboardRead",
     "clipboardWrite",
     "storage",
-    "scripting",
     "webNavigation"
   ],
   "host_permissions": [
+    "https://accounts.google.com/*",
+    "https://*.google.com/*",
+    "https://github.com/*",
+    "https://*.github.com/*",
+    "https://kiro.dev/*",
+    "https://*.kiro.dev/*",
+    "https://*.stripe.com/*",
+    "https://*.stripe.network/*",
     "http://127.0.0.1:37621/*",
-    "http://localhost:37621/*",
-    "<all_urls>"
+    "http://localhost:37621/*"
   ],
   "content_scripts": [
     {

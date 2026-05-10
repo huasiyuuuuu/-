@@ -27,22 +27,34 @@ async function getSession() {
 }
 
 async function fetchSmsCode(url) {
-  const response = await fetch(url, {
-    method: "GET",
-    cache: "no-store",
-    credentials: "omit",
-    headers: {
-      Accept: "application/json,text/plain,*/*"
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      cache: "no-store",
+      credentials: "omit",
+      signal: controller.signal,
+      headers: {
+        Accept: "application/json,text/plain,*/*"
+      }
+    });
+    const text = await response.text();
+    const parsed = parseSmsCode(text);
+    return {
+      ok: response.ok,
+      status: response.status,
+      code: parsed.code,
+      raw: parsed.raw || text
+    };
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      return { ok: false, status: 0, code: "", raw: "", error: "SMS API timeout (10s)" };
     }
-  });
-  const text = await response.text();
-  const parsed = parseSmsCode(text);
-  return {
-    ok: response.ok,
-    status: response.status,
-    code: parsed.code,
-    raw: parsed.raw || text
-  };
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function saveVaultToLocalFolder(vault) {
