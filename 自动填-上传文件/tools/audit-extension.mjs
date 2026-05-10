@@ -85,6 +85,7 @@ function runFieldInferenceAudit() {
     CSS: { escape: (value) => value }
   });
   const U = sandbox.VaultUtils;
+  // [attrs, parentText, expected-type]
   const cases = [
     [{ autocomplete: "postal-code" }, "Billing address Postal", "postal"],
     [{ autocomplete: "address-level2" }, "Billing address City", "city"],
@@ -92,11 +93,21 @@ function runFieldInferenceAudit() {
     [{ id: "Field-numberInput", name: "number", placeholder: "1234 1234 1234 1234" }, "", "cardNumber"],
     [{ id: "Field-expiryInput", name: "expiry", placeholder: "MM / YY" }, "", "expiry"],
     [{ id: "Field-cvcInput", name: "cvc", placeholder: "CVC" }, "", "cvv"],
-    [{ name: "code", placeholder: "Enter code", maxlength: "6" }, "Verification", "otp"]
+    [{ name: "code", placeholder: "Enter code", maxlength: "6" }, "Verification", "otp"],
+    // Broader OTP signals added in the fix for Bug B.
+    [{ name: "verificationCode", placeholder: "6-digit code" }, "Enter the code we sent to your phone", "otp"],
+    [{ inputmode: "numeric", maxlength: "6", type: "tel" }, "One time code", "otp"],
+    // Negative guard: inputmode=numeric but max 5 = still zip-like, not OTP.
+    [{ inputmode: "numeric", maxlength: "5", name: "zip" }, "Postal code", "postal"],
+    // Negative guard: the word "code" inside "Reference code" / "Promo code" / "Area code" shouldn't be OTP.
+    [{ name: "promo", placeholder: "Enter promo code" }, "Have a promo code?", ""],
+    [{ name: "area", placeholder: "Area code" }, "", ""],
+    // Stripe cvc has maxlength 3 and type=tel — must NOT be treated as OTP (CVV wins).
+    [{ id: "Field-cvcInput", name: "cvc", placeholder: "CVC", inputmode: "numeric", maxlength: "3" }, "", "cvv"]
   ];
   for (const [attrs, parentText, expected] of cases) {
     const actual = U.inferFieldType(new MockInput(attrs, parentText));
-    assert(actual === expected, `Field inference failed for ${expected}`, { attrs, parentText, actual });
+    assert(actual === expected, `Field inference failed for expected=${expected}`, { attrs, parentText, actual });
   }
 }
 
@@ -141,6 +152,9 @@ class MockInput {
   get isContentEditable() {
     return false;
   }
+
+  focus() { this.events.push("focus"); }
+  blur() { this.events.push("blur"); }
 }
 
 Object.defineProperty(MockInput.prototype, "value", {
@@ -181,7 +195,8 @@ function createContentSandbox(fields) {
       getBoundingClientRect: () => ({ width: 120, height: 36, left: 0, top: 0 })
     }),
     querySelector: () => null,
-    querySelectorAll: () => fields
+    querySelectorAll: () => fields,
+    addEventListener: () => {}
   };
   const sandbox = createSharedSandbox({
     window: {},
@@ -196,6 +211,7 @@ function createContentSandbox(fields) {
     CSS: { escape: (value) => value },
     Event: MockEvent,
     InputEvent: MockEvent,
+    KeyboardEvent: MockEvent,
     HTMLInputElement: MockInput,
     HTMLTextAreaElement: MockInput,
     MutationObserver: class {
@@ -323,6 +339,116 @@ async function runContentAudit(billing) {
   assert(purgeResponse.result.serviceWorkers === 1, "Frame service worker purge did not run", purgeResponse);
 }
 
+// New: regression for Bug A (masked card stub) and the "overwrite" toggle.
+async function runOverwritePolicyAudit(billing) {
+  // Scenario 1: a masked "•••• 4242" remnant is present in the card field.
+  // Even with overwriteExisting=false we should still replace it with the real card.
+  {
+    const fields = [new MockInput({ autocomplete: "cc-number", value: "•••• 4242" })];
+    const { listeners } = createContentSandbox(fields);
+    const r = await sendContentMessage(listeners[0], {
+      type: "fillFromPopup",
+      kind: "billing",
+      billing,
+      settings: { overwriteExisting: false }
+    });
+    assert(r.ok && r.filled === 1, "Masked stub should not block refill", { r, value: fields[0].value });
+    assert(fields[0].value === "4242424242424242", "Masked stub was not replaced with full card", fields[0].value);
+  }
+
+  // Scenario 2: the same (full) card is already in the field. No-op, no extra write.
+  {
+    const fields = [new MockInput({ autocomplete: "cc-number", value: "4242424242424242" })];
+    const { listeners } = createContentSandbox(fields);
+    const r = await sendContentMessage(listeners[0], {
+      type: "fillFromPopup",
+      kind: "billing",
+      billing,
+      settings: { overwriteExisting: false }
+    });
+    assert(r.ok && r.filled === 0, "Identical value should not be rewritten", r);
+  }
+
+  // Scenario 3: a DIFFERENT full card sits there. With overwriteExisting=false, we
+  // leave it alone (we never want to clobber equal-length mystery data silently).
+  // With overwriteExisting=true, we replace it.
+  {
+    const fields = [new MockInput({ autocomplete: "cc-number", value: "4000056655665556" })];
+    const { listeners } = createContentSandbox(fields);
+    const r1 = await sendContentMessage(listeners[0], {
+      type: "fillFromPopup",
+      kind: "billing",
+      billing,
+      settings: { overwriteExisting: false }
+    });
+    assert(r1.filled === 0 && fields[0].value === "4000056655665556", "Different full card must not be silently overwritten", { r1, value: fields[0].value });
+
+    const fields2 = [new MockInput({ autocomplete: "cc-number", value: "4000056655665556" })];
+    const { listeners: l2 } = createContentSandbox(fields2);
+    const r2 = await sendContentMessage(l2[0], {
+      type: "fillFromPopup",
+      kind: "billing",
+      billing,
+      settings: { overwriteExisting: true }
+    });
+    assert(r2.filled === 1 && fields2[0].value === "4242424242424242", "overwriteExisting=true must replace even equal-length card", { r2, value: fields2[0].value });
+  }
+}
+
+// New: OTP single-box AND 6-box segmented flow.
+async function runOtpFillAudit() {
+  // Single box: autocomplete=one-time-code, full 6-digit code goes in.
+  {
+    const fields = [new MockInput({ autocomplete: "one-time-code", maxlength: "6" })];
+    const { listeners } = createContentSandbox(fields);
+    const r = await sendContentMessage(listeners[0], {
+      type: "fillFromPopup",
+      kind: "smsCode",
+      code: "493812",
+      settings: {}
+    });
+    assert(r.filled === 1, "Single-box OTP should count as 1 filled", r);
+    assert(fields[0].value === "493812", "Single-box OTP value wrong", fields[0].value);
+    // beforeinput is now dispatched alongside input to wake up React/Stripe handlers.
+    assert(fields[0].events.includes("beforeinput"), "beforeinput event was not dispatched", fields[0].events);
+  }
+
+  // Segmented: 6 x maxlength=1, numeric inputmode. Each box gets one char.
+  {
+    const fields = Array.from({ length: 6 }, () => new MockInput({ maxlength: "1", inputmode: "numeric", type: "tel" }, "Enter the 6-digit code"));
+    const { listeners } = createContentSandbox(fields);
+    const r = await sendContentMessage(listeners[0], {
+      type: "fillFromPopup",
+      kind: "smsCode",
+      code: "493812",
+      settings: {}
+    });
+    assert(r.filled === 6, "Segmented OTP should report 6 fills", r);
+    assert(fields.map((field) => field.value).join("") === "493812", "Segmented OTP values wrong", fields.map((field) => field.value));
+    // The last filled box must have blurred (we call blur() at the end).
+    assert(fields[5].events.includes("blur"), "Segmented OTP should blur the last box", fields[5].events);
+    // At least one keydown/keyup pair was sent to advance focus.
+    assert(fields[0].events.includes("keydown") && fields[0].events.includes("keyup"), "Segmented OTP must dispatch keydown/keyup", fields[0].events);
+  }
+
+  // Mixed: a single full-code input wins over segmented ones.
+  {
+    const full = new MockInput({ autocomplete: "one-time-code", maxlength: "6" });
+    const segmented = Array.from({ length: 6 }, () => new MockInput({ maxlength: "1", inputmode: "numeric" }, "Enter the 6-digit code"));
+    const fields = [full, ...segmented];
+    const { listeners } = createContentSandbox(fields);
+    const r = await sendContentMessage(listeners[0], {
+      type: "fillFromPopup",
+      kind: "smsCode",
+      code: "493812",
+      settings: {}
+    });
+    assert(r.filled === 1 && full.value === "493812", "Full OTP box should be preferred over segmented", { r, full: full.value, segmented: segmented.map((s) => s.value) });
+    // Segmented boxes stay empty.
+    assert(segmented.every((s) => s.value === ""), "Segmented boxes must not be touched when a single box wins", segmented.map((s) => s.value));
+  }
+}
+
 async function runBackgroundVaultPrecedenceAudit() {
   const listeners = [];
   const removedSessionKeys = [];
@@ -375,6 +501,9 @@ async function runBackgroundVaultPrecedenceAudit() {
     URL,
     btoa: (value) => Buffer.from(value, "binary").toString("base64"),
     atob: (value) => Buffer.from(value, "base64").toString("binary"),
+    AbortController,
+    setTimeout,
+    clearTimeout,
     crypto: webcrypto
   };
   sandbox.self = sandbox;
@@ -392,8 +521,25 @@ async function runBackgroundVaultPrecedenceAudit() {
 
 function runManifestAudit() {
   const manifest = JSON.parse(read("manifest.json"));
-  assert(manifest.version === "0.1.5", "Manifest version mismatch", manifest.version);
+  assert(manifest.version === "0.1.6", "Manifest version mismatch", manifest.version);
   assert(manifest.permissions.includes("webNavigation"), "webNavigation permission missing", manifest.permissions);
+  // The `scripting` permission was removed along with the dead execution path in
+  // the encrypted-vault cleanup. Guard against it creeping back.
+  assert(!manifest.permissions.includes("scripting"), "Unused `scripting` permission should not be declared", manifest.permissions);
+  // `<all_urls>` is too broad for what this extension does.
+  assert(!manifest.host_permissions.includes("<all_urls>"), "<all_urls> must not appear in host_permissions", manifest.host_permissions);
+  // Kiro / Stripe / Google / GitHub plus loopback are required.
+  for (const required of [
+    "https://accounts.google.com/*",
+    "https://github.com/*",
+    "https://kiro.dev/*",
+    "https://*.kiro.dev/*",
+    "https://*.stripe.com/*",
+    "https://*.stripe.network/*",
+    "http://127.0.0.1:37621/*"
+  ]) {
+    assert(manifest.host_permissions.includes(required), `Missing host permission: ${required}`, manifest.host_permissions);
+  }
   assert(manifest.content_scripts?.[0]?.all_frames === true, "Content script must run in all frames", manifest.content_scripts?.[0]);
   assert(manifest.content_scripts?.[0]?.matches.includes("https://app.kiro.dev/*") || manifest.content_scripts?.[0]?.matches.includes("https://*.kiro.dev/*"), "Kiro app host missing", manifest.content_scripts?.[0]?.matches);
   assert(manifest.content_scripts?.[0]?.matches.includes("https://*.stripe.network/*"), "Stripe network frames missing", manifest.content_scripts?.[0]?.matches);
@@ -404,6 +550,8 @@ async function main() {
   const parsed = runParsingAudit();
   runFieldInferenceAudit();
   await runContentAudit(parsed.billing);
+  await runOverwritePolicyAudit(parsed.billing);
+  await runOtpFillAudit();
   await runBackgroundVaultPrecedenceAudit();
   console.log("AUDIT PASS");
 }

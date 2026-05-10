@@ -20,15 +20,22 @@ function sendJson(res, status, body) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
+    let settled = false;
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      fn(value);
+    };
     req.on("data", (chunk) => {
+      if (settled) return;
       body += chunk;
       if (body.length > 5 * 1024 * 1024) {
-        reject(new Error("Request body is too large."));
+        settle(reject, new Error("Request body is too large."));
         req.destroy();
       }
     });
-    req.on("end", () => resolve(body));
-    req.on("error", reject);
+    req.on("end", () => settle(resolve, body));
+    req.on("error", (error) => settle(reject, error));
   });
 }
 

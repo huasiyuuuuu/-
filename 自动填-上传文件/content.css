@@ -21,6 +21,24 @@
   transform: translateY(0);
 }
 
+.gba-toast[data-kind="bad"] {
+  border-color: rgba(255, 107, 95, 0.55);
+  background: rgba(42, 12, 10, 0.96);
+  color: #ffe3df;
+}
+
+.gba-toast[data-kind="warn"] {
+  border-color: rgba(240, 185, 91, 0.55);
+  background: rgba(36, 25, 8, 0.96);
+  color: #fce7b7;
+}
+
+.gba-toast[data-kind="good"] {
+  border-color: rgba(56, 193, 114, 0.55);
+  background: rgba(12, 28, 18, 0.96);
+  color: #d6f7e2;
+}
+
 .gba-dock {
   position: fixed;
   z-index: 2147483647;
@@ -28,11 +46,18 @@
   top: 50%;
   display: grid;
   justify-items: end;
-  gap: 8px;
+  gap: 6px;
   transform: translateY(-50%);
   font: 12px/1.35 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   pointer-events: auto;
   user-select: none;
+  opacity: 0.85;
+  transition: opacity 140ms ease;
+}
+
+.gba-dock:hover,
+.gba-dock[data-open="true"] {
+  opacity: 1;
 }
 
 .gba-dock-row {
@@ -42,12 +67,12 @@
 }
 
 .gba-dock-handle {
-  width: 48px;
+  width: 28px;
   height: 36px;
   border: 1px solid rgba(75, 85, 99, 0.72);
   border-radius: 999px;
   background: rgba(17, 24, 39, 0.9);
-  color: #cbd5e1;
+  color: #94a3b8;
   cursor: grab;
   font: 700 13px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   box-shadow: 0 10px 26px rgba(15, 23, 42, 0.22);
@@ -60,7 +85,6 @@
 }
 
 .gba-dock-main,
-.gba-dock-clean,
 .gba-dock-toggle {
   height: 36px;
   border: 1px solid rgba(59, 130, 246, 0.8);
@@ -74,32 +98,35 @@
 .gba-dock-main {
   min-width: 72px;
   border-radius: 999px;
-  padding: 0 12px;
+  padding: 0 14px;
 }
 
-.gba-dock-clean {
-  min-width: 60px;
-  border-radius: 999px;
-  padding: 0 10px;
-  border-color: rgba(148, 163, 184, 0.65);
-  background: rgba(30, 41, 59, 0.96);
+.gba-dock-main:hover {
+  background: rgba(29, 78, 216, 0.98);
 }
 
 .gba-dock-toggle {
   width: 32px;
   border-radius: 999px;
   padding: 0;
+  border-color: rgba(148, 163, 184, 0.55);
+  background: rgba(30, 41, 59, 0.94);
+  color: #e2e8f0;
+}
+
+.gba-dock-toggle:hover {
+  background: rgba(51, 65, 85, 0.98);
 }
 
 .gba-dock-panel {
   display: grid;
-  gap: 6px;
-  width: 112px;
-  padding: 7px;
+  gap: 5px;
+  width: 140px;
+  padding: 6px;
   border: 1px solid rgba(75, 85, 99, 0.7);
   border-radius: 8px;
-  background: rgba(17, 24, 39, 0.94);
-  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.28);
+  background: rgba(17, 24, 39, 0.96);
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.32);
 }
 
 .gba-dock-panel[hidden] {
@@ -108,14 +135,15 @@
 
 .gba-dock-panel button {
   min-height: 28px;
-  border: 1px solid rgba(99, 102, 241, 0.35);
+  border: 1px solid rgba(99, 102, 241, 0.25);
   border-radius: 6px;
-  background: rgba(30, 41, 59, 0.98);
+  background: rgba(30, 41, 59, 0.96);
   color: #eef2ff;
   cursor: pointer;
   font: inherit;
-  padding: 4px 7px;
+  padding: 4px 8px;
   white-space: nowrap;
+  text-align: left;
 }
 
 .gba-dock-panel button[data-primary="true"] {
@@ -124,6 +152,25 @@
   color: #fff;
 }
 
+.gba-dock-panel button[data-danger="true"] {
+  margin-top: 4px;
+  border-color: rgba(224, 92, 80, 0.55);
+  background: rgba(57, 14, 14, 0.9);
+  color: #ffb6ae;
+}
+
+.gba-dock-panel button[data-danger="true"]:hover {
+  border-color: rgba(224, 92, 80, 0.95);
+  background: rgba(96, 22, 22, 0.95);
+  color: #ffe3df;
+}
+
 .gba-dock-panel button:hover {
   background: rgba(49, 46, 129, 0.98);
+}
+
+.gba-dock-panel hr {
+  margin: 2px 0;
+  border: 0;
+  border-top: 1px solid rgba(75, 85, 99, 0.6);
 }

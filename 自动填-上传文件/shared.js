@@ -1,4 +1,11 @@
 (() => {
+  // Default per-record data persisted in chrome.storage.local.
+  //
+  // NOTE ON SECURITY: data is stored in plaintext under the `gba_plain_vault` key.
+  // There used to be an encrypted-vault path in this file (PBKDF2 + AES-GCM) but it
+  // was never wired through the UI and has been removed. If you want the data at
+  // rest to be encrypted, that needs to be added back together with a password
+  // prompt in the popup. See the README for the current threat model.
   const DEFAULT_VAULT = {
     version: 1,
     accounts: [],
@@ -16,16 +23,17 @@
     }
   };
 
+  // Storage keys.
+  //   plainVault       - current data (plain JSON under chrome.storage.local).
+  //   vaultBlob        - legacy encrypted payload; kept only so migrations can see it.
+  //   sessionVault     - legacy in-memory decrypted copy; kept so we can clear it on load.
+  //   sessionKey       - legacy AES key; same reason.
   const STORAGE_KEYS = {
     vaultBlob: "gba_vault_blob",
     plainVault: "gba_plain_vault",
     sessionVault: "gba_session_vault",
     sessionKey: "gba_session_key"
   };
-
-  const TEXT_ENCODER = new TextEncoder();
-  const TEXT_DECODER = new TextDecoder();
-  const PBKDF_ITERATIONS = 250000;
 
   function clone(value) {
     return JSON.parse(JSON.stringify(value));
@@ -36,6 +44,8 @@
     const suffix = Array.from(rand, (byte) => byte.toString(16).padStart(2, "0")).join("");
     return `${prefix}_${suffix}`;
   }
+
+  // --- Vault shape helpers ----------------------------------------------------
 
   function normalizeVault(vault) {
     const next = { ...clone(DEFAULT_VAULT), ...(vault || {}) };
@@ -81,114 +91,7 @@
     return normalized.settings.activeBatchId || normalized.batches[0]?.id || "";
   }
 
-  function bytesToBase64(bytes) {
-    let binary = "";
-    bytes.forEach((byte) => {
-      binary += String.fromCharCode(byte);
-    });
-    return btoa(binary);
-  }
-
-  function base64ToBytes(base64) {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
-  }
-
-  async function deriveAesKey(passphrase, saltBytes) {
-    const baseKey = await crypto.subtle.importKey(
-      "raw",
-      TEXT_ENCODER.encode(passphrase),
-      "PBKDF2",
-      false,
-      ["deriveKey"]
-    );
-    return crypto.subtle.deriveKey(
-      {
-        name: "PBKDF2",
-        salt: saltBytes,
-        iterations: PBKDF_ITERATIONS,
-        hash: "SHA-256"
-      },
-      baseKey,
-      { name: "AES-GCM", length: 256 },
-      true,
-      ["encrypt", "decrypt"]
-    );
-  }
-
-  async function keyToBase64(key) {
-    const raw = await crypto.subtle.exportKey("raw", key);
-    return bytesToBase64(new Uint8Array(raw));
-  }
-
-  async function keyFromBase64(keyB64) {
-    return crypto.subtle.importKey(
-      "raw",
-      base64ToBytes(keyB64),
-      { name: "AES-GCM" },
-      true,
-      ["encrypt", "decrypt"]
-    );
-  }
-
-  async function encryptVault(vault, key, saltB64 = "") {
-    const salt = saltB64 ? base64ToBytes(saltB64) : crypto.getRandomValues(new Uint8Array(16));
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const normalized = normalizeVault(vault);
-    const plaintext = TEXT_ENCODER.encode(JSON.stringify(normalized));
-    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
-    return {
-      version: 1,
-      kdf: "PBKDF2-SHA-256",
-      iterations: PBKDF_ITERATIONS,
-      salt: bytesToBase64(salt),
-      iv: bytesToBase64(iv),
-      ciphertext: bytesToBase64(new Uint8Array(ciphertext)),
-      updatedAt: new Date().toISOString()
-    };
-  }
-
-  async function decryptVault(blob, passphrase) {
-    const salt = base64ToBytes(blob.salt);
-    const key = await deriveAesKey(passphrase, salt);
-    const plaintext = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: base64ToBytes(blob.iv) },
-      key,
-      base64ToBytes(blob.ciphertext)
-    );
-    return {
-      vault: normalizeVault(JSON.parse(TEXT_DECODER.decode(plaintext))),
-      keyB64: await keyToBase64(key)
-    };
-  }
-
-  async function encryptVaultWithKeyB64(vault, keyB64, saltB64) {
-    const key = await keyFromBase64(keyB64);
-    return encryptVault(vault, key, saltB64);
-  }
-
-  async function createEncryptedVault(passphrase) {
-    const salt = crypto.getRandomValues(new Uint8Array(16));
-    const key = await deriveAesKey(passphrase, salt);
-    const vault = clone(DEFAULT_VAULT);
-    const blob = await encryptVault(vault, key, bytesToBase64(salt));
-    return {
-      blob,
-      vault,
-      keyB64: await keyToBase64(key)
-    };
-  }
-
-  function maskValue(value, keepStart = 3, keepEnd = 3) {
-    if (!value) return "";
-    const text = String(value);
-    if (text.length <= keepStart + keepEnd) return "*".repeat(text.length);
-    return `${text.slice(0, keepStart)}${"*".repeat(Math.min(12, text.length - keepStart - keepEnd))}${text.slice(-keepEnd)}`;
-  }
+  // --- TOTP (RFC 6238) --------------------------------------------------------
 
   function normalizeBase32(secret) {
     let text = String(secret || "").trim();
@@ -254,6 +157,12 @@
     return String(binary % 10 ** digits).padStart(digits, "0");
   }
 
+  function looksLikeBase32Secret(value) {
+    return normalizeBase32(value).length >= 16;
+  }
+
+  // --- Gmail / GitHub / Billing / SMS parsers --------------------------------
+
   function parseAccountLine(input) {
     const line = String(input || "")
       .split(/\r?\n/)
@@ -294,10 +203,6 @@
         seen.add(account.email);
         return true;
       });
-  }
-
-  function looksLikeBase32Secret(value) {
-    return normalizeBase32(value).length >= 16;
   }
 
   function parseGithubLine(input) {
@@ -407,9 +312,7 @@
   }
 
   function normalizeCardName(value) {
-    return cleanCapturedValue(value)
-      .replace(/\s{2,}/g, " ")
-      .trim();
+    return cleanCapturedValue(value).replace(/\s{2,}/g, " ").trim();
   }
 
   function firstMatch(text, patterns) {
@@ -563,6 +466,8 @@
     return { code: candidates[0].code, raw };
   }
 
+  // --- Field inspection / type inference --------------------------------------
+
   function visibleElement(element) {
     if (!element) return false;
     const style = getComputedStyle(element);
@@ -623,15 +528,16 @@
     if (/cc-exp|expiry|expiration|exp date|valid thru|有效期/.test(text)) return "expiry";
     if (/cc-csc|cvc|cvv|security code|安全码/.test(text)) return "cvv";
     if (/totp|otp|one[-\s]?time|one[-\s]?time code|authenticator|verification|verify code|login code|enter code|passcode|sms\s*code|text\s*code|auth\s*code|验证码|校验码|动态码|短信码|一次性密码|两步验证|安全码验证/.test(text)) return "otp";
-    // Standalone "code" heuristic + numeric-short inputmode fallback. Excludes zip/postal/promo/coupon/country/area/etc.
-    // Helps on 3DS / bank challenge pages where the field is just labelled "Code".
+    // Standalone "code" heuristic + numeric-short inputmode fallback. Excludes
+    // zip / postal / promo / coupon / country / area / reference codes which often
+    // contain the word "code" too.
     if (
       /\bcode\b/.test(text)
       && !/(zip|postal|post\s*code|promo|coupon|discount|referral|country|area|dial|product|voucher|gift|store|tracking|ref(?:erence)?\s*code|invite|invitation)/.test(text)
     ) return "otp";
     const maxLenAttr = Number(element.getAttribute("maxlength") || 0);
     const inputmodeAttr = (element.getAttribute("inputmode") || "").toLowerCase();
-    // maxlength 6-8 + numeric inputmode is a very strong OTP signal (avoid CVV's 3-4).
+    // maxlength 6-8 + numeric inputmode is a strong OTP signal (keeps CVV's 3-4 safe).
     if ((inputmodeAttr === "numeric" || inputmodeAttr === "decimal") && maxLenAttr >= 6 && maxLenAttr <= 8) return "otp";
     if (/cc-name|cardholder|name on card|holder name|持卡人|姓名/.test(text)) return "name";
     if (/tel|phone|mobile|手机号|电话/.test(text) || type === "tel") return "phone";
@@ -711,59 +617,7 @@
     return match?.[2] || "";
   }
 
-  async function getVaultBlob() {
-    const data = await chrome.storage.local.get([STORAGE_KEYS.vaultBlob]);
-    return data[STORAGE_KEYS.vaultBlob] || null;
-  }
-
-  async function getSessionVault() {
-    const data = await chrome.storage.session.get([STORAGE_KEYS.sessionVault, STORAGE_KEYS.sessionKey]);
-    return {
-      vault: data[STORAGE_KEYS.sessionVault] ? normalizeVault(data[STORAGE_KEYS.sessionVault]) : null,
-      keyB64: data[STORAGE_KEYS.sessionKey] || ""
-    };
-  }
-
-  async function unlockVault(passphrase) {
-    const blob = await getVaultBlob();
-    if (!blob) {
-      const created = await createEncryptedVault(passphrase);
-      await chrome.storage.local.set({ [STORAGE_KEYS.vaultBlob]: created.blob });
-      await chrome.storage.session.set({
-        [STORAGE_KEYS.sessionVault]: created.vault,
-        [STORAGE_KEYS.sessionKey]: created.keyB64
-      });
-      return { vault: created.vault, created: true };
-    }
-
-    const decrypted = await decryptVault(blob, passphrase);
-    await chrome.storage.session.set({
-      [STORAGE_KEYS.sessionVault]: decrypted.vault,
-      [STORAGE_KEYS.sessionKey]: decrypted.keyB64
-    });
-    return { vault: decrypted.vault, created: false };
-  }
-
-  async function saveVault(vault) {
-    const blob = await getVaultBlob();
-    const session = await getSessionVault();
-    if (!blob || !session.keyB64) {
-      throw new Error("Vault is locked.");
-    }
-    const normalized = normalizeVault(vault);
-    const nextBlob = await encryptVaultWithKeyB64(normalized, session.keyB64, blob.salt);
-    await chrome.storage.local.set({ [STORAGE_KEYS.vaultBlob]: nextBlob });
-    await chrome.storage.session.set({ [STORAGE_KEYS.sessionVault]: normalized });
-    return normalized;
-  }
-
-  async function lockVault() {
-    await chrome.storage.session.remove([STORAGE_KEYS.sessionVault, STORAGE_KEYS.sessionKey]);
-  }
-
-  async function hasVault() {
-    return Boolean(await getVaultBlob());
-  }
+  // --- Public export ---------------------------------------------------------
 
   globalThis.VaultUtils = {
     DEFAULT_VAULT,
@@ -774,9 +628,6 @@
     cleanBatchLabel,
     activeBatchId,
     normalizeVault,
-    createEncryptedVault,
-    decryptVault,
-    encryptVaultWithKeyB64,
     parseAccountLine,
     parseAccountLines,
     parseGithubLine,
@@ -789,13 +640,6 @@
     inferFieldType,
     visibleElement,
     formatExpiry,
-    splitAddress,
-    maskValue,
-    getVaultBlob,
-    getSessionVault,
-    unlockVault,
-    saveVault,
-    lockVault,
-    hasVault
+    splitAddress
   };
 })();

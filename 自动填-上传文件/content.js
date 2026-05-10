@@ -17,6 +17,9 @@
   let dragState = null;
   let dockEnabled = true;
   let syncDockTimer = null;
+  let domObserver = null;
+
+  // ---------- Page context / capability detection ----------
 
   function pageContext() {
     const host = location.hostname.toLowerCase();
@@ -48,7 +51,9 @@
     };
   }
 
-  function showToast(message) {
+  // ---------- Toast ----------
+
+  function showToast(message, kind = "") {
     let toast = document.querySelector(".gba-toast");
     if (!toast) {
       toast = document.createElement("div");
@@ -57,11 +62,15 @@
     }
     toast.textContent = message;
     toast.dataset.show = "true";
+    if (kind) toast.dataset.kind = kind;
+    else delete toast.dataset.kind;
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => {
       toast.dataset.show = "false";
-    }, 2200);
+    }, 2400);
   }
+
+  // ---------- Field writing ----------
 
   function setNativeValue(element, value) {
     const text = String(value ?? "");
@@ -90,12 +99,10 @@
 
     const prototype = element.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
-    // Fire a beforeinput first; some React/Stripe internal handlers rely on it to
-    // transition state. Swallowing it is fine -- we still write the value afterwards.
     try {
       element.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: text }));
     } catch {
-      // Older browsers may not support InputEvent('beforeinput', …). Safe to ignore.
+      // Older browsers may not support InputEvent('beforeinput'). Safe to ignore.
     }
     if (descriptor?.set) descriptor.set.call(element, text);
     else element.value = text;
@@ -124,29 +131,17 @@
 
   function effectivelyEmpty(text) {
     if (!text) return true;
-    const stripped = String(text).replace(MASK_STRIP, "");
-    if (!stripped) return true;
-    // "xxxx" style placeholders stripped already; also treat a short digit-run that's clearly
-    // a masked tail (e.g. just "4242") as partial, not "already filled".
-    return false;
+    return !String(text).replace(MASK_STRIP, "");
   }
 
   function shouldSetValue(field, value, settings, kind = "") {
     if (value == null || value === "") return false;
     const currentText = String(field.isContentEditable ? field.textContent : field.value || "").trim();
 
-    // Empty or looks masked -> always fill.
     if (effectivelyEmpty(currentText)) return true;
-
-    // Same value already present -> no write (but the caller may still want to re-dispatch events).
     if (currentText === String(value)) return false;
-
-    // User opted in to overwrite.
     if (settings?.overwriteExisting) return true;
 
-    // Smart overwrite: if the incoming value is "more complete" than what's already there,
-    // we replace it. This is what saves the Stripe case where a partially-typed or
-    // browser-autofilled card is blocking the real fill.
     const newDigits = digits(value).length;
     const curDigits = digits(currentText).length;
     if (kind === "cardNumber") return curDigits < newDigits;
@@ -197,8 +192,6 @@
   }
 
   function findSegmentedOtpGroup(fields, requiredLen) {
-    // Pick contiguous (in DOM order) single-char number-like inputs that are likely
-    // the boxes of a segmented OTP widget (GitHub recovery / many 3DS challenge pages).
     const cand = fields.filter((field) => {
       if (!field || field.tagName !== "INPUT") return false;
       const maxlen = Number(field.getAttribute("maxlength") || 0);
@@ -210,8 +203,6 @@
       return !inputmode || inputmode === "numeric" || inputmode === "decimal" || inputmode === "text";
     });
     if (cand.length < Math.min(requiredLen, 4)) return null;
-    // Only take as many as we need so we don't accidentally fill a whole row of
-    // unrelated 1-char inputs.
     return cand.slice(0, Math.min(cand.length, Math.max(requiredLen, 4)));
   }
 
@@ -223,7 +214,6 @@
       const box = boxes[i];
       try { box.focus?.(); } catch { /* focus may throw in certain frames */ }
       if (setNativeValue(box, chars[i])) filled += 1;
-      // Some implementations advance focus only on keydown/keyup. Fire synthetic ones.
       try {
         box.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: chars[i] }));
         box.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: chars[i] }));
@@ -240,7 +230,6 @@
     const fields = fieldsNear(target || document.body);
     const otpFields = fields.filter((field) => inferFieldType(field) === "otp");
 
-    // Prefer the single "enter the whole code" box when available.
     const singleBox = otpFields.find((field) => Number(field.getAttribute("maxlength") || 0) !== 1);
     if (singleBox) {
       try { singleBox.focus?.(); } catch { /* ignore */ }
@@ -250,16 +239,14 @@
       }
     }
 
-    // Fall back to segmented inputs. Use the explicit otp-typed ones first; if
-    // we still don't have enough, try all visible fields (some sites don't mark
-    // the boxes with aria/code keywords at all).
     const segmentedOtp = otpFields.filter((field) => Number(field.getAttribute("maxlength") || 0) === 1);
-    let boxes = segmentedOtp.length >= Math.min(code.length, 4) ? segmentedOtp : findSegmentedOtpGroup(fields, code.length);
+    const boxes = segmentedOtp.length >= Math.min(code.length, 4)
+      ? segmentedOtp
+      : findSegmentedOtpGroup(fields, code.length);
     if (boxes && boxes.length >= Math.min(code.length, 4)) {
       return fillSegmentedOtp(boxes, code);
     }
 
-    // Last resort: write the whole code into each otp-typed box we saw.
     let filled = 0;
     for (const field of otpFields) {
       if (shouldSetValue(field, code, settings, "otp") && setNativeValue(field, code)) filled += 1;
@@ -313,24 +300,13 @@
   async function withVault(handler) {
     const snapshot = await chrome.runtime.sendMessage({ type: "getVaultSnapshot" });
     if (!snapshot?.unlocked || !snapshot.vault) {
-      showToast("Paste and save data in the extension popup first");
+      showToast("先在扩展弹窗里粘贴并保存数据", "warn");
       return 0;
     }
     return handler(getSelected(snapshot.vault));
   }
 
-  function dockButton(label, handler, primary = false) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = label;
-    if (primary) button.dataset.primary = "true";
-    button.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      handler().catch((error) => showToast(error?.message || "Action failed"));
-    });
-    return button;
-  }
+  // ---------- Dock positioning + drag ----------
 
   function clampDockPosition(left, top) {
     const rect = dock?.getBoundingClientRect();
@@ -403,6 +379,8 @@
     });
   }
 
+  // ---------- High-level dock actions ----------
+
   async function autoFillForContext(context) {
     const filled = await withVault(async ({ settings, account, github, billing }) => {
       if (context.isPayment || context.isKiro) {
@@ -420,12 +398,14 @@
       if (context.isGithubLogin) return fillAccount(document.body, github || account, settings);
       return fillAccount(document.body, account || github, settings);
     });
-    showToast(filled ? `Filled ${filled} fields` : "No matching fields found");
+    if (filled) showToast(`Filled ${filled} fields`, "good");
+    else showToast("没找到可填字段（试试弹窗里开\"覆盖已有字段\"）", "warn");
   }
 
   function logoutOriginsForContext() {
     const origins = new Set([location.origin]);
-    if (pageContext().isKiro || /kiro/i.test(location.hostname)) {
+    const ctx = pageContext();
+    if (ctx.isKiro || /kiro/i.test(location.hostname)) {
       origins.add("https://app.kiro.dev");
       origins.add("https://kiro.dev");
       origins.add("https://auth.kiro.dev");
@@ -441,7 +421,7 @@
       origins.add("https://hooks.stripe.com");
       origins.add("https://m.stripe.network");
     }
-    if (pageContext().isPayment) {
+    if (ctx.isPayment) {
       origins.add("https://billing.stripe.com");
       origins.add("https://checkout.stripe.com");
       origins.add("https://js.stripe.com");
@@ -504,7 +484,10 @@
 
   async function clearLoginData() {
     const origins = logoutOriginsForContext();
-    const confirmed = confirm(`Deep clear cookies and site storage for:\n${origins.join("\n")}\n\nThe page will reload.`);
+    const confirmed = confirm(
+      `深度清理本地 Cookie / 缓存 / storage：\n${origins.join("\n")}\n\n` +
+      "注意：这只清除本机数据，不会让 Google 服务器端退出登录。页面会刷新。"
+    );
     if (!confirmed) return;
     try {
       sessionStorage.clear();
@@ -514,12 +497,12 @@
     }
     const response = await chrome.runtime.sendMessage({ type: "clearSiteData", origins, hard: true });
     if (!response?.ok) throw new Error(response?.error || "Clear failed");
-    showToast("Deep site data cleared");
+    showToast("已深度清理本地站点记录", "good");
   }
 
   async function fetchAndFillSmsCodeFromDock() {
     await withVault(async ({ settings, billing }) => {
-      if (!billing?.smsApi) throw new Error("No SMS API");
+      if (!billing?.smsApi) throw new Error("当前账单没有接码 API");
       let code = "";
       for (let attempt = 1; attempt <= 6; attempt += 1) {
         const response = await chrome.runtime.sendMessage({ type: "fetchSmsCode", url: billing.smsApi });
@@ -528,9 +511,9 @@
         if (code) break;
         if (attempt < 6) await new Promise((resolve) => setTimeout(resolve, 2500));
       }
-      if (!code) throw new Error("SMS API returned no code");
+      if (!code) throw new Error("接码 API 没返回验证码");
       await navigator.clipboard.writeText(code);
-      showToast(`SMS ${code} · waiting for input…`);
+      showToast(`SMS ${code} · 等待输入框…`, "warn");
       // The 3DS / challenge iframe often mounts only after the user hits "Pay".
       // Poll for ~12s so the user can open the challenge and we'll still fill.
       let filled = 0;
@@ -548,9 +531,37 @@
         if (filled > 0) break;
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
-      showToast(filled ? `SMS code filled: ${filled}` : `SMS code copied: ${code}`);
+      if (filled) showToast(`验证码已填入 ${filled} 个字段`, "good");
+      else showToast(`验证码 ${code} 已复制，12 秒内未找到输入框`, "warn");
       return filled;
     });
+  }
+
+  async function copy2fa() {
+    await withVault(async ({ account, github }) => {
+      const selected = pageContext().isGithubLogin ? github || account : account || github;
+      if (!selected?.totpSecret) throw new Error("没有 2FA 密钥");
+      const code = await totpCode(selected.totpSecret);
+      await navigator.clipboard.writeText(code);
+      showToast(`2FA 已复制：${code}`, "good");
+      return 0;
+    });
+  }
+
+  // ---------- Dock DOM ----------
+
+  function dockButton(label, handler, { primary = false, danger = false } = {}) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    if (primary) button.dataset.primary = "true";
+    if (danger) button.dataset.danger = "true";
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      handler().catch((error) => showToast(error?.message || "操作失败", "bad"));
+    });
+    return button;
   }
 
   function createDock() {
@@ -559,78 +570,75 @@
 
     dock = document.createElement("div");
     dock.className = "gba-dock";
+    dock.dataset.open = "false";
 
     const handle = document.createElement("button");
     handle.type = "button";
     handle.className = "gba-dock-handle";
-    handle.textContent = "拖动";
-    handle.title = "按住拖动悬浮按钮";
+    handle.textContent = "⋮⋮";
+    handle.title = "按住拖动";
 
     const main = document.createElement("button");
     main.type = "button";
     main.className = "gba-dock-main";
     main.textContent = "Fill";
+    main.title = "一键填充当前页";
     main.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      autoFillForContext(pageContext()).catch((error) => showToast(error?.message || "Fill failed"));
+      autoFillForContext(pageContext()).catch((error) => showToast(error?.message || "填充失败", "bad"));
     });
 
     const toggle = document.createElement("button");
     toggle.type = "button";
     toggle.className = "gba-dock-toggle";
-    toggle.textContent = "...";
-
-    const clean = document.createElement("button");
-    clean.type = "button";
-    clean.className = "gba-dock-clean";
-    clean.textContent = context.isKiro ? "深清Kiro" : "深清理";
-    clean.title = "深度清理当前站点登录记录";
-    clean.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      clearLoginData().catch((error) => showToast(error?.message || "Clear failed"));
-    });
+    toggle.textContent = "⋯";
+    toggle.title = "更多操作";
 
     const panel = document.createElement("div");
     panel.className = "gba-dock-panel";
     panel.hidden = true;
+
     panel.append(
       dockButton("Gmail", async () => {
         const filled = await withVault(({ settings, account }) => fillAccount(document.body, account, settings));
-        showToast(filled ? `Filled Gmail: ${filled}` : "No Gmail fields found");
-      }, context.isGoogleLogin),
+        showToast(filled ? `已填 Gmail: ${filled}` : "没找到 Gmail 字段", filled ? "good" : "warn");
+      }, { primary: context.isGoogleLogin }),
       dockButton("GitHub", async () => {
         const filled = await withVault(({ settings, github }) => fillAccount(document.body, github, settings));
-        showToast(filled ? `Filled GitHub: ${filled}` : "No GitHub fields found");
-      }, context.isGithubLogin),
-      dockButton("Billing", async () => {
+        showToast(filled ? `已填 GitHub: ${filled}` : "没找到 GitHub 字段", filled ? "good" : "warn");
+      }, { primary: context.isGithubLogin }),
+      dockButton("账单", async () => {
         const filled = await withVault(({ settings, billing }) => fillBilling(document.body, billing, settings));
-        showToast(filled ? `Filled billing: ${filled}` : "No billing fields found");
-      }, context.isPayment),
-      dockButton("Copy 2FA", async () => {
-        await withVault(async ({ account, github }) => {
-          const selected = pageContext().isGithubLogin ? github || account : account || github;
-          if (!selected?.totpSecret) throw new Error("No 2FA secret");
-          const code = await totpCode(selected.totpSecret);
-          await navigator.clipboard.writeText(code);
-          showToast(`2FA copied: ${code}`);
-          return 0;
-        });
-      }),
-      dockButton("SMS code", fetchAndFillSmsCodeFromDock),
-      dockButton(context.isKiro ? "Clear Kiro+Google" : "Clear site", clearLoginData)
+        showToast(filled ? `已填账单: ${filled}` : "没找到账单字段", filled ? "good" : "warn");
+      }, { primary: context.isPayment }),
+      dockButton("Copy 2FA", copy2fa),
+      dockButton("取短信码", fetchAndFillSmsCodeFromDock),
+    );
+
+    panel.append(document.createElement("hr"));
+    panel.append(
+      dockButton(context.isKiro ? "深清 Kiro+Google" : "深清本地", clearLoginData, { danger: true })
     );
 
     toggle.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
       panel.hidden = !panel.hidden;
+      dock.dataset.open = panel.hidden ? "false" : "true";
     });
+
+    // Close panel on outside click.
+    document.addEventListener("click", (event) => {
+      if (panel.hidden) return;
+      if (dock.contains(event.target)) return;
+      panel.hidden = true;
+      dock.dataset.open = "false";
+    }, true);
 
     const row = document.createElement("div");
     row.className = "gba-dock-row";
-    row.append(handle, main, clean, toggle);
+    row.append(handle, main, toggle);
     dock.append(panel, row);
     document.documentElement.appendChild(dock);
     enableDockDrag(handle);
@@ -651,6 +659,11 @@
     createDock();
   }
 
+  function scheduleDockSync() {
+    clearTimeout(syncDockTimer);
+    syncDockTimer = setTimeout(syncDock, 250);
+  }
+
   async function refreshDockSetting() {
     try {
       const data = await chrome.storage.local.get([STORAGE_KEYS.plainVault]);
@@ -662,9 +675,50 @@
     syncDock();
   }
 
-  function scheduleDockSync() {
-    clearTimeout(syncDockTimer);
-    syncDockTimer = setTimeout(syncDock, 120);
+  // ---------- Page-change detection (no more 1s polling) ----------
+
+  function hookNavigation() {
+    // Sample-SPA-safe hooks: intercept history changes and fire a custom event so we
+    // re-evaluate dock visibility only when something meaningful happens.
+    const fire = () => scheduleDockSync();
+    try {
+      const h = typeof history !== "undefined" ? history : null;
+      if (h?.pushState) {
+        const origPush = h.pushState;
+        const origReplace = h.replaceState;
+        h.pushState = function pushStatePatched(...args) {
+          const result = origPush.apply(this, args);
+          fire();
+          return result;
+        };
+        h.replaceState = function replaceStatePatched(...args) {
+          const result = origReplace.apply(this, args);
+          fire();
+          return result;
+        };
+      }
+    } catch {
+      // If history isn't writable (some hardened CSP contexts), skip the patch.
+    }
+    try {
+      window.addEventListener?.("popstate", fire);
+      window.addEventListener?.("hashchange", fire);
+      window.addEventListener?.("pageshow", fire);
+      window.addEventListener?.("visibilitychange", () => {
+        if (document.visibilityState === "visible") fire();
+      });
+    } catch {
+      // addEventListener is missing in the audit mock; we're fine without these hooks.
+    }
+  }
+
+  function installDomObserver() {
+    // One root observer only; debounced. We don't need to re-check on every mutation —
+    // the context detection only depends on the document URL + a small set of
+    // payment-field selectors, so 250 ms debounce is more than enough.
+    if (domObserver) return;
+    domObserver = new MutationObserver(scheduleDockSync);
+    domObserver.observe(document.documentElement, { childList: true, subtree: true });
   }
 
   function extractPageData() {
@@ -678,9 +732,11 @@
     };
   }
 
+  // ---------- Bootstrap ----------
+
   refreshDockSetting();
-  setInterval(syncDock, 1000);
-  new MutationObserver(scheduleDockSync).observe(document.documentElement, { childList: true, subtree: true });
+  hookNavigation();
+  installDomObserver();
 
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName === "local" && changes[STORAGE_KEYS.plainVault]) {
@@ -705,7 +761,7 @@
           filled = await fillAccount(document.body, preferGithub ? message.github || message.account : message.account, message.settings);
           filled += fillBilling(document.body, message.billing, message.settings);
         }
-        if (filled) showToast(`Filled ${filled} fields`);
+        if (filled) showToast(`已填 ${filled} 个字段`, "good");
         sendResponse({ ok: true, filled });
         return;
       }
