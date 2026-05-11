@@ -29,7 +29,7 @@
   // We deliberately accept multiple casings and separators; the real key
   // isn't documented, so fuzzy-matching buys us resilience.
   const CSRF_KEY_RE = /csrf|xsrf/i;
-  const ARN_RE = /arn:aws:codewhisperer:[a-z0-9-]+:\d+:profile\/[A-Z0-9]+/;
+  const ARN_RE = /arn:aws:codewhisperer:[a-z0-9-]+:\d+:profile\/[A-Z0-9-]+/;
 
   function scanLocalStorageForCsrf() {
     try {

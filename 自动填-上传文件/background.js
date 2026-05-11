@@ -255,12 +255,21 @@ async function buildKiroSessionExport({ name = "" } = {}) {
   }
   if (!session.csrf_token) missing.push("csrf_token");
   if (!session.profile_arn) missing.push("profile_arn");
+  // noKiroTab: no app.kiro.dev/kiro.dev tab was open when we tried to ask the
+  // content script. Popup uses this to surface an actionable message
+  // ("please open app.kiro.dev/home first") instead of silently missing two fields.
+  // noCookies: chrome.cookies.getAll returned nothing for either domain,
+  // usually because the user isn't logged in yet.
+  const noKiroTab = !tab;
+  const noCookies = cookies.length === 0;
   return {
     session,
     missing,
     cookieCount: cookies.length,
     tabUrl: tab?.url || "",
-    csrfSource: extras.csrfSource || ""
+    csrfSource: extras.csrfSource || "",
+    noKiroTab,
+    noCookies
   };
 }
 
@@ -273,7 +282,7 @@ function validateKiroSession(session) {
   }
   if (!session.access_token) return { ok: false, error: "access_token empty" };
   if (!session.refresh_token) return { ok: false, error: "refresh_token empty" };
-  if (!/^arn:aws:codewhisperer:[a-z0-9-]+:\d+:profile\/[A-Z0-9]+$/.test(session.profile_arn)) {
+  if (!/^arn:aws:codewhisperer:[a-z0-9-]+:\d+:profile\/[A-Z0-9-]+$/.test(session.profile_arn)) {
     return { ok: false, error: "profile_arn shape invalid" };
   }
   if (Number.isNaN(Date.parse(session.exported_at))) return { ok: false, error: "exported_at not ISO" };

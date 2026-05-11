@@ -176,8 +176,10 @@ node local-save-server.js
 
 打开"更多工具"折叠区，有两颗按钮：
 
-- **导出 Kiro Session** — 抓一次当前登录态，组装成 JSON 拷到剪贴板，并存入 `chrome.storage.local.kiro_sessions_vault`。
-- **导出所有 Kiro Sessions** — 展开历次导出记录，可单条复制 JSON，也可把整个数组一次性复制出去（供 Kiro-A / Kiro-B 的 kirogate-web 消费）。
+- **导出 Kiro Session** — 抓一次当前登录态，组装成 JSON。
+  - **复制到剪贴板（30 秒后自动清空）** — 和密码 / 2FA / SMS 一样的 transient 策略，避免 token 长期残留剪贴板。
+  - 存入 `chrome.storage.local.kiro_sessions_vault`（明文 JSON，最多保留 50 条，超出时最旧的会被挤出去）。
+- **导出所有 Kiro Sessions** — 点一下就：(1) 把 vault 里的全部 Session 作为 JSON 数组复制到剪贴板（同样 30 秒 TTL），(2) 展开列表显示每一条（名字 / 导出时间 / 「复制」「✕」按钮）。再点一次收起列表。
 
 ### 抓哪些字段
 
@@ -191,7 +193,7 @@ node local-save-server.js
   "csrf_token": "...",             // 来自 app.kiro.dev 的 localStorage（模糊匹配 csrf / xsrf）
   "user_id": "d-...",              // 来自 cookie: UserId
   "visitor_id": "17...-...",       // 来自 cookie: kiro-visitor-id
-  "profile_arn": "arn:aws:codewhisperer:us-east-1:NNNNNNNNNNNN:profile/LLLLLLLLLLLL",
+  "profile_arn": "arn:aws:codewhisperer:us-east-1:NNNNNNNNNNNN:profile/LLLL-LLLL-LLLL",
                                    // 来自 fetch/XHR 拦截，抓 /service/KiroWebPortalService/operation/* 响应
   "exported_at": "<ISO 时间戳>",
   "idp": "Google"                  // 来自 cookie: Idp，仅调试用，可为空
@@ -204,20 +206,23 @@ node local-save-server.js
 - **csrf_token**：只在 `app.kiro.dev` 有个 MV3 isolated-world 内容脚本 `kiro-session-content.js`，扫一遍 `localStorage` 里 key 含 `csrf`/`xsrf` 的条目，挑最长的那条当 token；同时兼容 `<meta name="csrf-token">` 样式。
 - **profile_arn**：`kiro-capture.js` 在 MAIN world 里 patch `fetch` 和 `XMLHttpRequest`，只对命中 `/service/KiroWebPortalService/operation/*` 的响应做一次 clone，找到 `profileArn` 后缓存进 `sessionStorage.kiro_captured_profile_arn`。扩展读这个缓存值。注意：需要你在 app.kiro.dev 上先做一次真实操作（刷新主页即可），拦截器才来得及录到 ARN。
 
-### 抓不到时的手工兜底（must-have）
+### 常见失败 + 兜底
 
-自动化是尽力路线，手工是保底路线。如果点完按钮：
+按后台返回的信号给出可操作提示：
 
-- `csrf_token` 为空 → popup 会弹 `prompt("...请粘贴 csrf_token...")`。
-  手工步骤：F12 → Application → Local Storage → `https://app.kiro.dev` → 搜 `csrf`，复制值。
-- `profile_arn` 为空 → 同样弹 prompt。
-  手工步骤：F12 → Network → 刷新 app.kiro.dev 首页 → 找任意一个 `KiroWebPortalService/operation/...` 响应 → Preview → 找 `profileArn` 字段，复制 `arn:aws:codewhisperer:...:profile/...` 完整串。
+- **没找到 Kiro cookies**（`noCookies: true`）→ 通常是还没登录。toast 提示"先打开 https://app.kiro.dev/home 并登录"，不进入 prompt 流程。
+- **没有打开 Kiro 标签页**（`noKiroTab: true`）→ csrf / profile_arn 抓不到，先提示"先打开 app.kiro.dev"。但仍然允许继续 prompt 手动粘贴（方便从别处拷过来的 power user）。
+- `csrf_token` / `profile_arn` 自动抓不到 → popup 弹 `prompt`：
+  - `csrf_token`：F12 → Application → Local Storage → `https://app.kiro.dev` → 搜 `csrf`，复制值。
+  - `profile_arn`：F12 → Network → 刷新 app.kiro.dev 首页 → 找任意一个 `KiroWebPortalService/operation/...` 响应 → Preview → 找 `profileArn` 字段。
 
-手工粘贴后 JSON 会一并拷到剪贴板。如果所有必需字段都齐了才会落进 `kiro_sessions_vault`，缺字段只复制不入库——避免 kirogate-web 拿到一条半成品后疑惑。
+手工粘贴后 JSON 仍按 transient 规则拷到剪贴板。只有所有必需字段都齐了才会落进 `kiro_sessions_vault`——缺字段只复制不入库，避免 kirogate-web 拿到一条半成品。
 
-### 权限
+### 权限与安全
 
-这条路径需要 `cookies` 权限，manifest 里已声明。`host_permissions` 只覆盖 `kiro.dev` / `*.kiro.dev`，不会动 Google / GitHub / Stripe 的 cookie。
+- 需要 `cookies` 权限（manifest 已声明），仅用于读 `kiro.dev` / `app.kiro.dev` 域，不动 Google / GitHub / Stripe 的 cookie。
+- `kiro_sessions_vault` 是 `chrome.storage.local` 的**明文 JSON**，包含 access/refresh token。威胁模型同"[安全边界与威胁模型](#安全边界与威胁模型)"一节。
+- 剪贴板里的 Session JSON **30 秒后自动清空**（前提是你没在期间手动复制了别的内容——我们清之前会先读一次剪贴板确认）。
 
 ---
 

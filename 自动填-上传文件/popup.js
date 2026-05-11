@@ -984,6 +984,22 @@
     toastTimer = setTimeout(() => { els.toast.hidden = true; }, ttlMs);
   }
 
+  // Writes a full session JSON to the clipboard with a 30s TTL (same
+  // treatment as passwords / 2FA / SMS codes). Session objects contain
+  // bearer + refresh tokens — we do NOT want them sitting in the user's
+  // clipboard forever. Falls back to plain writeText if the transient
+  // helper isn't available for some reason.
+  async function copySessionJsonTransient(json) {
+    try {
+      await copyTransient(json, { ttlMs: 30000 });
+    } catch (error) {
+      // Last-resort fallback: write once without TTL rather than drop the
+      // copy entirely, because the user expects clipboard behaviour.
+      await navigator.clipboard.writeText(json);
+      throw error;
+    }
+  }
+
   function promptFor(field, current) {
     const label = {
       csrf_token: "csrf_token（F12 → Application → Local Storage 里搜 csrf）",
@@ -1003,6 +1019,19 @@
       showToast(response?.error || "导出失败", "bad");
       return;
     }
+    // Actionable-error fast paths: the two most common failure modes have
+    // cheap fixes that we should surface instead of going through the
+    // manual-prompt fallback (which feels broken if the user isn't even
+    // logged in yet).
+    if (response.noCookies) {
+      showToast("没找到 Kiro cookies — 请先在 Chrome 里打开 https://app.kiro.dev/home 并完成登录，再点导出", "bad", 6000);
+      return;
+    }
+    if (response.noKiroTab) {
+      showToast("没有打开 app.kiro.dev 标签页 — csrf / profile_arn 抓不到。请先登录 app.kiro.dev，再点导出", "warn", 6000);
+      // Still fall through to the prompt path below so power users who
+      // have the values handy can finish the export anyway.
+    }
     let { session, missing } = response;
     // Ask the user to paste whatever we couldn't grab.
     if (missing.includes("csrf_token")) {
@@ -1021,7 +1050,7 @@
 
     const json = JSON.stringify(session, null, 2);
     try {
-      await navigator.clipboard.writeText(json);
+      await copySessionJsonTransient(json);
     } catch (error) {
       setMessage(`复制剪贴板失败：${error?.message || error}`, "bad");
     }
@@ -1033,18 +1062,35 @@
       try {
         const saveRes = await chrome.runtime.sendMessage({ type: "saveKiroSession", session });
         if (saveRes?.ok) {
-          showToast(`已导出 Session "${session.name}"，已复制到剪贴板（vault 共 ${saveRes.count} 条）`, "good");
+          showToast(`已导出 Session "${session.name}"，已复制（30s 后清剪贴板）· vault 共 ${saveRes.count} 条`, "good", 5000);
         } else {
-          showToast(`已导出 Session，已复制到剪贴板，但未能保存到 vault：${saveRes?.error || ""}`, "warn", 5000);
+          showToast(`已复制（30s 后清剪贴板），但未能保存到 vault：${saveRes?.error || ""}`, "warn", 6000);
         }
       } catch (error) {
-        showToast(`已复制到剪贴板；保存 vault 失败：${error?.message || error}`, "warn", 5000);
+        showToast(`已复制（30s 后清剪贴板）；保存 vault 失败：${error?.message || error}`, "warn", 6000);
       }
     } else {
-      showToast(`已复制到剪贴板，但字段缺失：${stillMissing.join(", ")}（未保存到 vault）`, "warn", 6000);
+      showToast(`已复制（30s 后清剪贴板），但字段缺失：${stillMissing.join(", ")}（未保存到 vault）`, "warn", 7000);
     }
 
     await refreshKiroSessionsList({ keepOpen: !els.kiroSessionsList.hidden });
+  }
+
+  async function exportAllKiroSessionsToClipboard() {
+    const response = await chrome.runtime.sendMessage({ type: "listKiroSessions" });
+    const sessions = response?.sessions || [];
+    if (!sessions.length) {
+      showToast("vault 里还没有 Kiro Session — 先点\"导出 Kiro Session\"抓一条", "warn", 4500);
+      return;
+    }
+    try {
+      await copySessionJsonTransient(JSON.stringify(sessions, null, 2));
+      showToast(`已复制 ${sessions.length} 条 Session（JSON 数组，30s 后清剪贴板）`, "good", 4500);
+    } catch (error) {
+      showToast(`复制失败：${error?.message || error}`, "bad");
+    }
+    // Also show the list so the user sees what was copied.
+    await refreshKiroSessionsList({ keepOpen: true });
   }
 
   function formatExportedAt(iso) {
@@ -1069,23 +1115,8 @@
     } else {
       const header = document.createElement("div");
       header.className = "empty-hint";
-      header.textContent = `共 ${sessions.length} 条 · 点「复制」复制单条 JSON`;
+      header.textContent = `共 ${sessions.length} 条 · 点「复制」复制单条 JSON（30s 后自动清剪贴板）`;
       container.append(header);
-
-      const exportAllBtn = document.createElement("button");
-      exportAllBtn.type = "button";
-      exportAllBtn.className = "session-action";
-      exportAllBtn.textContent = "复制全部（JSON 数组）";
-      exportAllBtn.style.width = "100%";
-      exportAllBtn.addEventListener("click", async () => {
-        try {
-          await navigator.clipboard.writeText(JSON.stringify(sessions, null, 2));
-          showToast(`已复制 ${sessions.length} 条 Session 到剪贴板`, "good");
-        } catch (error) {
-          showToast(`复制失败：${error?.message || error}`, "bad");
-        }
-      });
-      container.append(exportAllBtn);
 
       for (const session of sessions) {
         const row = document.createElement("div");
@@ -1106,8 +1137,8 @@
         copyBtn.textContent = "复制";
         copyBtn.addEventListener("click", async () => {
           try {
-            await navigator.clipboard.writeText(JSON.stringify(session, null, 2));
-            showToast(`已复制 "${session.name}" 到剪贴板`, "good");
+            await copySessionJsonTransient(JSON.stringify(session, null, 2));
+            showToast(`已复制 "${session.name}"（30s 后自动清剪贴板）`, "good");
           } catch (error) {
             showToast(`复制失败：${error?.message || error}`, "bad");
           }
@@ -1139,12 +1170,18 @@
   }
 
   if (els.listKiroSessions) {
+    // The button is labelled "导出所有 Kiro Sessions". Users expect clicking
+    // it to *export* — not merely toggle a list. So we: (1) copy the full
+    // JSON array to clipboard (transient, 30s TTL), (2) expand the list so
+    // they can see what was copied and inspect individual rows. Clicking
+    // again toggles the list shut without re-copying.
     els.listKiroSessions.addEventListener("click", async () => {
-      const willShow = els.kiroSessionsList.hidden;
-      if (willShow) {
-        await refreshKiroSessionsList({ keepOpen: true });
+      if (els.kiroSessionsList.hidden) {
+        await exportAllKiroSessionsToClipboard().catch((error) =>
+          showToast(error?.message || "导出失败", "bad"));
+      } else {
+        els.kiroSessionsList.hidden = true;
       }
-      els.kiroSessionsList.hidden = !willShow;
     });
   }
 

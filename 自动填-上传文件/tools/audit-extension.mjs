@@ -808,6 +808,43 @@ async function runKiroSessionExportAudit() {
     "Missing csrf/profile_arn must be reported so the popup can fall back to prompt", degraded);
   // Name must default to the timestamp when empty.
   assert(degraded.session.name === degraded.session.exported_at, "Empty name must fall back to timestamp", degraded.session);
+
+  // Step 6: real-world profile_arn IDs can contain dashes
+  // (e.g. "ABCD-EFGH-1234"). validateKiroSession must accept those, not just
+  // [A-Z0-9]+. Regression test for the original too-strict regex.
+  //
+  // Note: saveKiroSession dedups by user_id, so the dashed-ARN session
+  // REPLACES the previous row (same user_id) rather than being appended.
+  // The vault should still only have 1 entry after this, but that entry's
+  // profile_arn must now be the dashed one.
+  {
+    const arnWithDashes = { ...session, profile_arn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/ABCD-EFGH-1234" };
+    const r = await send({ type: "saveKiroSession", session: arnWithDashes });
+    assert(r?.ok, "ARN with dashes must pass schema validation", r);
+    assert(storage.kiro_sessions_vault.length === 1, "Same user_id must replace, not append", storage.kiro_sessions_vault);
+    assert(storage.kiro_sessions_vault[0].profile_arn === arnWithDashes.profile_arn,
+      "Dashed ARN must be persisted after replace", storage.kiro_sessions_vault[0]);
+  }
+
+  // Step 7: noKiroTab / noCookies actionable-error flags. The popup reads
+  // these to decide whether to show "please open app.kiro.dev" vs run the
+  // prompt fallback.
+  {
+    sandbox.chrome.tabs.query = async () => []; // no Kiro tab open
+    sandbox.__cookieJar = cookieJar;             // cookies still present
+    const r = await send({ type: "exportKiroSession", name: "tab-gone" });
+    assert(r.noKiroTab === true, "noKiroTab must be true when no kiro.dev tab is open", r);
+    assert(r.noCookies === false, "noCookies must be false when cookies are still present", r);
+  }
+  {
+    // Empty the cookie jar to simulate a logged-out browser. The handler
+    // should still succeed (we don't throw), but noCookies flips to true.
+    sandbox.chrome.cookies.getAll = async () => [];
+    const r = await send({ type: "exportKiroSession", name: "logged-out" });
+    assert(r.noCookies === true, "noCookies must be true when chrome.cookies returns nothing", r);
+    assert(r.session.access_token === "" && r.session.refresh_token === "",
+      "Session must be empty-string-filled (not undefined) in the logged-out case", r.session);
+  }
 }
 
 function runManifestAudit() {

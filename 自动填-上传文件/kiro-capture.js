@@ -20,7 +20,7 @@
   const STORAGE_KEY = "kiro_captured_profile_arn";
   const STORAGE_META = "kiro_captured_profile_arn_at";
   const URL_MATCH = /\/service\/KiroWebPortalService\/operation\//i;
-  const ARN_RE = /arn:aws:codewhisperer:[a-z0-9-]+:\d+:profile\/[A-Z0-9]+/;
+  const ARN_RE = /arn:aws:codewhisperer:[a-z0-9-]+:\d+:profile\/[A-Z0-9-]+/;
 
   function rememberArn(arn) {
     if (!arn || typeof arn !== "string") return;
