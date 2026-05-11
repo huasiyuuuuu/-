@@ -555,3 +555,94 @@ details.more .row-2 + button {
   opacity: 0.65;
   cursor: not-allowed;
 }
+
+
+/* -------- Kiro Sessions list ------------------------------------------- */
+
+.kiro-sessions {
+  display: grid;
+  gap: 4px;
+  margin-top: 8px;
+  max-height: 180px;
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  font-size: 12px;
+}
+
+.kiro-sessions[hidden] { display: none; }
+
+.kiro-sessions .empty-hint {
+  color: var(--muted);
+  padding: 4px 2px;
+}
+
+.kiro-sessions .session-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 4px;
+  border-bottom: 1px dashed var(--line);
+}
+
+.kiro-sessions .session-row:last-child { border-bottom: 0; }
+
+.kiro-sessions .session-name {
+  color: var(--text);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kiro-sessions .session-meta {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.kiro-sessions .session-action {
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
+/* -------- Toast ------------------------------------------------------- */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  padding: 8px 14px;
+  border-radius: 6px;
+  background: var(--panel-strong);
+  color: var(--text);
+  font-size: 12px;
+  border: 1px solid var(--line);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  z-index: 999;
+  max-width: 380px;
+  text-align: center;
+}
+
+.toast[hidden] { display: none; }
+
+.toast[data-kind="good"] {
+  border-color: var(--good);
+  background: var(--good-bg);
+  color: var(--good);
+}
+
+.toast[data-kind="warn"] {
+  border-color: var(--warn);
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+.toast[data-kind="bad"] {
+  border-color: var(--bad);
+  background: var(--bad-bg);
+  color: var(--bad);
+}

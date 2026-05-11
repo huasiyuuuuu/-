@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "账号填充清洗助手",
   "description": "Paste-to-tags autofill helper for Google login, GitHub, Kiro, and Stripe payment pages.",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "action": {
     "default_title": "账号填充清洗助手",
     "default_popup": "popup.html"
@@ -15,6 +15,7 @@
     "browsingData",
     "clipboardRead",
     "clipboardWrite",
+    "cookies",
     "storage",
     "webNavigation"
   ],
@@ -49,6 +50,28 @@
       ],
       "run_at": "document_idle",
       "all_frames": true
+    },
+    {
+      "matches": [
+        "https://kiro.dev/*",
+        "https://*.kiro.dev/*"
+      ],
+      "js": [
+        "kiro-session-content.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "kiro-capture.js"
+      ],
+      "matches": [
+        "https://kiro.dev/*",
+        "https://*.kiro.dev/*"
+      ]
     }
   ]
 }

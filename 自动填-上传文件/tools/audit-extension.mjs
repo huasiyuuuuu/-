@@ -658,13 +658,204 @@ async function runBackgroundVaultPrecedenceAudit() {
   assert(removedSessionKeys.includes("gba_session_vault"), "Legacy session vault was not cleared", removedSessionKeys);
 }
 
+// Smoke-test the Kiro Session export path end-to-end in a service-worker
+// sandbox: mock chrome.cookies / chrome.tabs / chrome.storage.local, then
+// hit the same message handlers the popup uses (exportKiroSession,
+// saveKiroSession, listKiroSessions). Validate the returned JSON against
+// the documented schema.
+async function runKiroSessionExportAudit() {
+  const listeners = [];
+  const storage = {}; // stand-in for chrome.storage.local
+
+  // Simulated cookie jar. Real Chrome returns one row per (domain,name,path);
+  // we include an "IdP" row as well to exercise the case-insensitive
+  // cookie-name mapping.
+  const cookieJar = [
+    { domain: ".kiro.dev", name: "AccessToken", path: "/", value: "aoa.EXAMPLE.access.token.value-xxxxxxxxxxxxxxxxxxxxx" },
+    { domain: ".kiro.dev", name: "RefreshToken", path: "/", value: "aor.EXAMPLE.refresh.token.value-yyyyyyyyyyyyyyyyyy" },
+    { domain: ".kiro.dev", name: "UserId", path: "/", value: "d-abc123def456" },
+    { domain: ".kiro.dev", name: "kiro-visitor-id", path: "/", value: "1716530000000-d4e5f6a7-b8c9-0a1b" },
+    { domain: "app.kiro.dev", name: "IdP", path: "/", value: "Google" },
+    // Unrelated cookie that must be ignored.
+    { domain: ".kiro.dev", name: "analytics_session", path: "/", value: "don't ship me" }
+  ];
+
+  const sandbox = {
+    console,
+    self: null,
+    importScripts: (name) => {
+      vm.runInContext(read(name), sandbox);
+    },
+    chrome: {
+      storage: {
+        local: {
+          get: async (keys) => {
+            const out = {};
+            const list = Array.isArray(keys) ? keys : keys == null ? Object.keys(storage) : [keys];
+            for (const k of list) if (k in storage) out[k] = storage[k];
+            return out;
+          },
+          set: async (obj) => { Object.assign(storage, obj); }
+        },
+        session: {
+          get: async () => ({}),
+          remove: async () => {}
+        }
+      },
+      runtime: {
+        onMessage: {
+          addListener: (listener) => listeners.push(listener)
+        }
+      },
+      cookies: {
+        // Emulate the { domain } filter: returns cookies whose .domain
+        // suffix-matches the queried domain (how real Chrome behaves too).
+        getAll: async (filter) => {
+          const dom = String(filter?.domain || "").toLowerCase();
+          if (!dom) return cookieJar.slice();
+          return cookieJar.filter((c) => {
+            const d = String(c.domain || "").toLowerCase();
+            return d === dom || d === `.${dom}` || d.endsWith(`.${dom}`);
+          });
+        }
+      },
+      tabs: {
+        query: async () => [
+          { id: 42, url: "https://app.kiro.dev/home" }
+        ],
+        sendMessage: async (_tabId, msg) => {
+          if (msg?.type === "getCsrfAndProfileArn") {
+            return {
+              ok: true,
+              csrfToken: "EXAMPLE-CSRF-TOKEN-abc123-xyz789-abcdef123456",
+              profileArn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/EXAMPLEPROFILE01",
+              csrfSource: "localStorage:kiro_csrf_token",
+              href: "https://app.kiro.dev/home",
+              host: "app.kiro.dev"
+            };
+          }
+          return { ok: true };
+        },
+        reload: () => {}
+      },
+      browsingData: { remove: () => {} },
+      webNavigation: { getAllFrames: async () => [] }
+    },
+    fetch: async () => ({ ok: true, status: 200, text: async () => "" }),
+    TextEncoder,
+    TextDecoder,
+    URL,
+    btoa: (value) => Buffer.from(value, "binary").toString("base64"),
+    atob: (value) => Buffer.from(value, "base64").toString("binary"),
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    crypto: webcrypto
+  };
+  sandbox.self = sandbox;
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(read("background.js"), sandbox);
+  assert(listeners.length === 1, "Background did not register a single message listener", listeners.length);
+  const listener = listeners[0];
+
+  function send(message) {
+    return new Promise((resolve) => listener(message, { tab: { id: 1 } }, resolve));
+  }
+
+  // Step 1: exportKiroSession — assemble JSON from cookies + content script.
+  const exportRes = await send({ type: "exportKiroSession", name: "Smoke Test" });
+  assert(exportRes?.ok, "exportKiroSession must return ok:true", exportRes);
+  const { session, missing } = exportRes;
+  assert(session && typeof session === "object", "session must be an object", exportRes);
+  // Field mapping from cookie names to schema keys.
+  assert(session.access_token.startsWith("aoa."), "access_token must come from AccessToken cookie", session);
+  assert(session.refresh_token.startsWith("aor."), "refresh_token must come from RefreshToken cookie", session);
+  assert(session.user_id === "d-abc123def456", "user_id must come from UserId cookie", session);
+  assert(session.visitor_id.startsWith("1716530000000-"), "visitor_id must come from kiro-visitor-id cookie", session);
+  assert(session.idp === "Google", "idp must come from Idp cookie (case-insensitive)", session);
+  assert(session.csrf_token.length > 8, "csrf_token must come from content script", session);
+  assert(/^arn:aws:codewhisperer:/.test(session.profile_arn), "profile_arn must come from content script", session);
+  assert(typeof session.exported_at === "string" && !Number.isNaN(Date.parse(session.exported_at)),
+    "exported_at must be ISO", session);
+  assert(session.name === "Smoke Test", "name must propagate from the request", session);
+  assert(Array.isArray(missing) && missing.length === 0, "no missing fields when cookies + content script are healthy", exportRes);
+
+  // Step 2: saveKiroSession — persists into chrome.storage.local under kiro_sessions_vault.
+  const saveRes = await send({ type: "saveKiroSession", session });
+  assert(saveRes?.ok && saveRes.count === 1, "saveKiroSession must persist and return count", saveRes);
+  assert(Array.isArray(storage.kiro_sessions_vault), "kiro_sessions_vault must hold an array", storage);
+  assert(storage.kiro_sessions_vault.length === 1, "kiro_sessions_vault must contain 1 session", storage);
+
+  // Step 3: listKiroSessions round-trip.
+  const listRes = await send({ type: "listKiroSessions" });
+  assert(listRes?.ok && listRes.sessions.length === 1, "listKiroSessions must return 1 session", listRes);
+  assert(listRes.sessions[0].user_id === "d-abc123def456", "listKiroSessions returned wrong session", listRes);
+
+  // Step 4: schema guard — refuse to save a session with a bogus profile_arn.
+  const bogus = { ...session, profile_arn: "not-an-arn" };
+  const rejectRes = await send({ type: "saveKiroSession", session: bogus });
+  assert(rejectRes?.ok === false && /profile_arn/.test(rejectRes.error || ""),
+    "saveKiroSession must reject malformed profile_arn", rejectRes);
+  assert(storage.kiro_sessions_vault.length === 1,
+    "Rejected save must not bloat the vault", storage);
+
+  // Step 5: fallback path — when content script can't supply csrf/profile_arn,
+  // export still succeeds but flags the missing fields so the popup can prompt.
+  sandbox.chrome.tabs.sendMessage = async () => ({ ok: true, csrfToken: "", profileArn: "", csrfSource: "" });
+  const degraded = await send({ type: "exportKiroSession", name: "" });
+  assert(degraded.ok && degraded.missing.includes("csrf_token") && degraded.missing.includes("profile_arn"),
+    "Missing csrf/profile_arn must be reported so the popup can fall back to prompt", degraded);
+  // Name must default to the timestamp when empty.
+  assert(degraded.session.name === degraded.session.exported_at, "Empty name must fall back to timestamp", degraded.session);
+
+  // Step 6: real-world profile_arn IDs can contain dashes
+  // (e.g. "ABCD-EFGH-1234"). validateKiroSession must accept those, not just
+  // [A-Z0-9]+. Regression test for the original too-strict regex.
+  //
+  // Note: saveKiroSession dedups by user_id, so the dashed-ARN session
+  // REPLACES the previous row (same user_id) rather than being appended.
+  // The vault should still only have 1 entry after this, but that entry's
+  // profile_arn must now be the dashed one.
+  {
+    const arnWithDashes = { ...session, profile_arn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/ABCD-EFGH-1234" };
+    const r = await send({ type: "saveKiroSession", session: arnWithDashes });
+    assert(r?.ok, "ARN with dashes must pass schema validation", r);
+    assert(storage.kiro_sessions_vault.length === 1, "Same user_id must replace, not append", storage.kiro_sessions_vault);
+    assert(storage.kiro_sessions_vault[0].profile_arn === arnWithDashes.profile_arn,
+      "Dashed ARN must be persisted after replace", storage.kiro_sessions_vault[0]);
+  }
+
+  // Step 7: noKiroTab / noCookies actionable-error flags. The popup reads
+  // these to decide whether to show "please open app.kiro.dev" vs run the
+  // prompt fallback.
+  {
+    sandbox.chrome.tabs.query = async () => []; // no Kiro tab open
+    sandbox.__cookieJar = cookieJar;             // cookies still present
+    const r = await send({ type: "exportKiroSession", name: "tab-gone" });
+    assert(r.noKiroTab === true, "noKiroTab must be true when no kiro.dev tab is open", r);
+    assert(r.noCookies === false, "noCookies must be false when cookies are still present", r);
+  }
+  {
+    // Empty the cookie jar to simulate a logged-out browser. The handler
+    // should still succeed (we don't throw), but noCookies flips to true.
+    sandbox.chrome.cookies.getAll = async () => [];
+    const r = await send({ type: "exportKiroSession", name: "logged-out" });
+    assert(r.noCookies === true, "noCookies must be true when chrome.cookies returns nothing", r);
+    assert(r.session.access_token === "" && r.session.refresh_token === "",
+      "Session must be empty-string-filled (not undefined) in the logged-out case", r.session);
+  }
+}
+
 function runManifestAudit() {
   const manifest = JSON.parse(read("manifest.json"));
-  assert(manifest.version === "0.1.7", "Manifest version mismatch", manifest.version);
+  assert(manifest.version === "0.1.8", "Manifest version mismatch", manifest.version);
   assert(manifest.permissions.includes("webNavigation"), "webNavigation permission missing", manifest.permissions);
   // The `scripting` permission was removed along with the dead execution path in
   // the encrypted-vault cleanup. Guard against it creeping back.
   assert(!manifest.permissions.includes("scripting"), "Unused `scripting` permission should not be declared", manifest.permissions);
+  // The `cookies` permission was added for the Kiro Session export feature.
+  assert(manifest.permissions.includes("cookies"), "cookies permission missing (required by Kiro Session export)", manifest.permissions);
   // `<all_urls>` is too broad for what this extension does.
   assert(!manifest.host_permissions.includes("<all_urls>"), "<all_urls> must not appear in host_permissions", manifest.host_permissions);
   // Kiro / Stripe / Google / GitHub plus loopback are required.
@@ -682,6 +873,16 @@ function runManifestAudit() {
   assert(manifest.content_scripts?.[0]?.all_frames === true, "Content script must run in all frames", manifest.content_scripts?.[0]);
   assert(manifest.content_scripts?.[0]?.matches.includes("https://app.kiro.dev/*") || manifest.content_scripts?.[0]?.matches.includes("https://*.kiro.dev/*"), "Kiro app host missing", manifest.content_scripts?.[0]?.matches);
   assert(manifest.content_scripts?.[0]?.matches.includes("https://*.stripe.network/*"), "Stripe network frames missing", manifest.content_scripts?.[0]?.matches);
+
+  // Kiro Session export needs its own content script at document_start on
+  // kiro.dev and a web-accessible MAIN-world capturer.
+  const kiroContentScript = (manifest.content_scripts || []).find((entry) => (entry.js || []).includes("kiro-session-content.js"));
+  assert(kiroContentScript, "manifest.content_scripts missing kiro-session-content.js entry", manifest.content_scripts);
+  assert(kiroContentScript.run_at === "document_start", "kiro-session-content.js must run at document_start", kiroContentScript);
+  assert((kiroContentScript.matches || []).includes("https://*.kiro.dev/*"), "kiro-session-content.js must target *.kiro.dev", kiroContentScript);
+  const war = manifest.web_accessible_resources || [];
+  const exposesCapture = war.some((entry) => (entry.resources || []).includes("kiro-capture.js"));
+  assert(exposesCapture, "kiro-capture.js must be web-accessible for MAIN-world injection", war);
 }
 
 async function main() {
@@ -693,6 +894,7 @@ async function main() {
   await runOtpFillAudit();
   await runStructuredDetailsAudit(parsed.billing);
   await runBackgroundVaultPrecedenceAudit();
+  await runKiroSessionExportAudit();
   console.log("AUDIT PASS");
 }
 
