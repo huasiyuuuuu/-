@@ -37,6 +37,10 @@
     autoFillOnHover: document.querySelector("#autoFillOnHover"),
     overwriteExisting: document.querySelector("#overwriteExisting"),
     message: document.querySelector("#message"),
+    toast: document.querySelector("#toast"),
+    exportKiroSession: document.querySelector("#exportKiroSession"),
+    listKiroSessions: document.querySelector("#listKiroSessions"),
+    kiroSessionsList: document.querySelector("#kiroSessionsList"),
     // Deep-clean dialog (injected by popup.html).
     cleanDialog: document.querySelector("#cleanDialog"),
     cleanDialogOrigins: document.querySelector("#cleanDialogOrigins"),
@@ -955,6 +959,194 @@
       "good"
     );
   });
+
+  // --- Kiro Session export ------------------------------------------------
+  //
+  // UI flow:
+  //   "导出 Kiro Session"      → collects cookies + csrf + profile_arn,
+  //                              copies the JSON to clipboard, toasts, and
+  //                              appends to kiro_sessions_vault.
+  //   "导出所有 Kiro Sessions" → toggles a list of saved sessions with a
+  //                              per-row copy-JSON button + an export-all
+  //                              button at the top.
+  //
+  // When csrf_token or profile_arn come back empty the code prompts the
+  // user to paste them from DevTools. That's the documented fallback:
+  // "完整自动化是 nice-to-have, 手动兜底是 must-have".
+
+  let toastTimer = null;
+  function showToast(text, kind = "good", ttlMs = 3500) {
+    if (!els.toast) return;
+    els.toast.textContent = text;
+    els.toast.dataset.kind = kind;
+    els.toast.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { els.toast.hidden = true; }, ttlMs);
+  }
+
+  function promptFor(field, current) {
+    const label = {
+      csrf_token: "csrf_token（F12 → Application → Local Storage 里搜 csrf）",
+      profile_arn: "profile_arn（F12 → Network 找一个 KiroWebPortalService 响应里的 profileArn）"
+    }[field] || field;
+    const value = window.prompt(`没自动抓到 ${field}，请粘贴 ${label}，或留空取消：`, current || "");
+    return value == null ? "" : value.trim();
+  }
+
+  async function doExportKiroSession() {
+    showToast("正在读取 Kiro cookies / csrf / profile_arn…", "warn", 2000);
+    const defaultName = new Date().toISOString().replace(/[:.]/g, "-");
+    const name = window.prompt("给这个 Session 起个名字（可留空用时间戳）：", defaultName) || defaultName;
+
+    const response = await chrome.runtime.sendMessage({ type: "exportKiroSession", name });
+    if (!response?.ok) {
+      showToast(response?.error || "导出失败", "bad");
+      return;
+    }
+    let { session, missing } = response;
+    // Ask the user to paste whatever we couldn't grab.
+    if (missing.includes("csrf_token")) {
+      const manual = promptFor("csrf_token", session.csrf_token);
+      if (manual) session.csrf_token = manual;
+    }
+    if (missing.includes("profile_arn")) {
+      const manual = promptFor("profile_arn", session.profile_arn);
+      if (manual) session.profile_arn = manual;
+    }
+
+    const stillMissing = [];
+    for (const key of ["access_token", "refresh_token", "csrf_token", "user_id", "visitor_id", "profile_arn"]) {
+      if (!session[key]) stillMissing.push(key);
+    }
+
+    const json = JSON.stringify(session, null, 2);
+    try {
+      await navigator.clipboard.writeText(json);
+    } catch (error) {
+      setMessage(`复制剪贴板失败：${error?.message || error}`, "bad");
+    }
+
+    if (!stillMissing.length) {
+      // Only persist into kiro_sessions_vault when all required fields are
+      // present — a half-filled session is worse than no session because
+      // kirogate-web will reject it later with a confusing error.
+      try {
+        const saveRes = await chrome.runtime.sendMessage({ type: "saveKiroSession", session });
+        if (saveRes?.ok) {
+          showToast(`已导出 Session "${session.name}"，已复制到剪贴板（vault 共 ${saveRes.count} 条）`, "good");
+        } else {
+          showToast(`已导出 Session，已复制到剪贴板，但未能保存到 vault：${saveRes?.error || ""}`, "warn", 5000);
+        }
+      } catch (error) {
+        showToast(`已复制到剪贴板；保存 vault 失败：${error?.message || error}`, "warn", 5000);
+      }
+    } else {
+      showToast(`已复制到剪贴板，但字段缺失：${stillMissing.join(", ")}（未保存到 vault）`, "warn", 6000);
+    }
+
+    await refreshKiroSessionsList({ keepOpen: !els.kiroSessionsList.hidden });
+  }
+
+  function formatExportedAt(iso) {
+    if (!iso) return "";
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return iso;
+    return date.toLocaleString();
+  }
+
+  async function refreshKiroSessionsList({ keepOpen = false } = {}) {
+    const container = els.kiroSessionsList;
+    if (!container) return;
+    const response = await chrome.runtime.sendMessage({ type: "listKiroSessions" });
+    const sessions = response?.sessions || [];
+    container.replaceChildren();
+
+    if (!sessions.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty-hint";
+      empty.textContent = "还没有保存过 Kiro Session。点上面的\"导出 Kiro Session\"先抓一条。";
+      container.append(empty);
+    } else {
+      const header = document.createElement("div");
+      header.className = "empty-hint";
+      header.textContent = `共 ${sessions.length} 条 · 点「复制」复制单条 JSON`;
+      container.append(header);
+
+      const exportAllBtn = document.createElement("button");
+      exportAllBtn.type = "button";
+      exportAllBtn.className = "session-action";
+      exportAllBtn.textContent = "复制全部（JSON 数组）";
+      exportAllBtn.style.width = "100%";
+      exportAllBtn.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(JSON.stringify(sessions, null, 2));
+          showToast(`已复制 ${sessions.length} 条 Session 到剪贴板`, "good");
+        } catch (error) {
+          showToast(`复制失败：${error?.message || error}`, "bad");
+        }
+      });
+      container.append(exportAllBtn);
+
+      for (const session of sessions) {
+        const row = document.createElement("div");
+        row.className = "session-row";
+
+        const name = document.createElement("div");
+        name.className = "session-name";
+        name.textContent = session.name || "(未命名)";
+        name.title = `user_id: ${session.user_id || ""}\nidp: ${session.idp || ""}`;
+
+        const meta = document.createElement("div");
+        meta.className = "session-meta";
+        meta.textContent = formatExportedAt(session.exported_at);
+
+        const copyBtn = document.createElement("button");
+        copyBtn.type = "button";
+        copyBtn.className = "session-action";
+        copyBtn.textContent = "复制";
+        copyBtn.addEventListener("click", async () => {
+          try {
+            await navigator.clipboard.writeText(JSON.stringify(session, null, 2));
+            showToast(`已复制 "${session.name}" 到剪贴板`, "good");
+          } catch (error) {
+            showToast(`复制失败：${error?.message || error}`, "bad");
+          }
+        });
+
+        const delBtn = document.createElement("button");
+        delBtn.type = "button";
+        delBtn.className = "session-action ghost";
+        delBtn.textContent = "✕";
+        delBtn.title = "从 vault 删除";
+        delBtn.addEventListener("click", async () => {
+          if (!confirm(`从 vault 删除 Session "${session.name}"？（不影响 kiro.dev 上的登录）`)) return;
+          await chrome.runtime.sendMessage({ type: "deleteKiroSession", exportedAt: session.exported_at });
+          await refreshKiroSessionsList({ keepOpen: true });
+        });
+
+        row.append(name, meta, copyBtn, delBtn);
+        container.append(row);
+      }
+    }
+
+    container.hidden = keepOpen ? false : container.hidden;
+  }
+
+  if (els.exportKiroSession) {
+    els.exportKiroSession.addEventListener("click", () => {
+      doExportKiroSession().catch((error) => showToast(error?.message || "导出失败", "bad"));
+    });
+  }
+
+  if (els.listKiroSessions) {
+    els.listKiroSessions.addEventListener("click", async () => {
+      const willShow = els.kiroSessionsList.hidden;
+      if (willShow) {
+        await refreshKiroSessionsList({ keepOpen: true });
+      }
+      els.kiroSessionsList.hidden = !willShow;
+    });
+  }
 
   loadVault()
     .then(render)

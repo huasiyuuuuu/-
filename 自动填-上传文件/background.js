@@ -2,6 +2,19 @@ importScripts("shared.js");
 
 const { STORAGE_KEYS, normalizeVault, parseSmsCode } = self.VaultUtils;
 const LOCAL_SAVE_API = "http://127.0.0.1:37621";
+const KIRO_SESSIONS_KEY = "kiro_sessions_vault";
+// Domains we ask chrome.cookies for when exporting a Kiro session. We pass
+// the naked domain to getAll() so both subdomain and host-only cookies are
+// returned ({ domain: 'kiro.dev' } matches *.kiro.dev as well).
+const KIRO_COOKIE_DOMAINS = ["kiro.dev", "app.kiro.dev"];
+// Cookie-name → export field mapping. Keys are lower-cased for comparison.
+const KIRO_COOKIE_FIELD_MAP = {
+  "accesstoken": "access_token",
+  "refreshtoken": "refresh_token",
+  "userid": "user_id",
+  "kiro-visitor-id": "visitor_id",
+  "idp": "idp"
+};
 
 async function getSession() {
   const localData = await chrome.storage.local.get([STORAGE_KEYS.plainVault]);
@@ -145,6 +158,147 @@ async function purgeOpenFrames(tabId) {
   return { ok: true, frames: result.frames };
 }
 
+// --- Kiro Session export --------------------------------------------------
+//
+// Pulls auth cookies from kiro.dev / app.kiro.dev, asks the active Kiro tab
+// for csrf_token + profile_arn (those don't live in cookies), and assembles
+// a single session object. Missing fields are left as empty strings — the
+// popup is responsible for showing the user which ones it couldn't grab so
+// they can paste from DevTools as a fallback.
+
+async function getAllKiroCookies() {
+  const seen = new Map();
+  for (const domain of KIRO_COOKIE_DOMAINS) {
+    let cookies;
+    try {
+      cookies = await chrome.cookies.getAll({ domain });
+    } catch (_) {
+      cookies = [];
+    }
+    for (const cookie of cookies || []) {
+      // Dedup on (domain,name,path) so we don't count the same cookie twice
+      // when both the .kiro.dev and app.kiro.dev sweeps return it.
+      const key = `${cookie.domain}|${cookie.name}|${cookie.path}`;
+      if (!seen.has(key)) seen.set(key, cookie);
+    }
+  }
+  return [...seen.values()];
+}
+
+function cookieMapToFields(cookies) {
+  // Build case-insensitive name → value map. If a cookie name appears on
+  // multiple domains, prefer the one with the longer value (tokens are long,
+  // flags are short).
+  const picks = {};
+  for (const cookie of cookies || []) {
+    const key = String(cookie.name || "").toLowerCase();
+    if (!KIRO_COOKIE_FIELD_MAP[key]) continue;
+    const value = String(cookie.value || "");
+    if (!value) continue;
+    const prev = picks[key];
+    if (!prev || String(prev.value || "").length < value.length) {
+      picks[key] = cookie;
+    }
+  }
+  const fields = {};
+  for (const [cookieKey, fieldKey] of Object.entries(KIRO_COOKIE_FIELD_MAP)) {
+    const cookie = picks[cookieKey];
+    fields[fieldKey] = cookie ? String(cookie.value || "") : "";
+  }
+  return fields;
+}
+
+async function findActiveKiroTab() {
+  const tabs = await chrome.tabs.query({ url: ["https://kiro.dev/*", "https://*.kiro.dev/*"] });
+  if (!tabs?.length) return null;
+  // Prefer an app.kiro.dev tab (profile_arn only shows up after login there).
+  return tabs.find((tab) => /app\.kiro\.dev/.test(tab.url || ""))
+      || tabs.find((tab) => /\.kiro\.dev/.test(tab.url || ""))
+      || tabs[0];
+}
+
+async function askTabForCsrfAndArn(tabId) {
+  if (!tabId) return { csrfToken: "", profileArn: "", csrfSource: "" };
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, { type: "getCsrfAndProfileArn" });
+    if (!response?.ok) return { csrfToken: "", profileArn: "", csrfSource: "" };
+    return {
+      csrfToken: response.csrfToken || "",
+      profileArn: response.profileArn || "",
+      csrfSource: response.csrfSource || ""
+    };
+  } catch (_) {
+    return { csrfToken: "", profileArn: "", csrfSource: "" };
+  }
+}
+
+async function buildKiroSessionExport({ name = "" } = {}) {
+  const cookies = await getAllKiroCookies();
+  const fields = cookieMapToFields(cookies);
+  const tab = await findActiveKiroTab();
+  const extras = await askTabForCsrfAndArn(tab?.id);
+  const exportedAt = new Date().toISOString();
+  const session = {
+    name: String(name || "").trim() || exportedAt,
+    access_token: fields.access_token || "",
+    refresh_token: fields.refresh_token || "",
+    csrf_token: extras.csrfToken || "",
+    user_id: fields.user_id || "",
+    visitor_id: fields.visitor_id || "",
+    profile_arn: extras.profileArn || "",
+    exported_at: exportedAt,
+    idp: fields.idp || ""
+  };
+  const missing = [];
+  for (const key of ["access_token", "refresh_token", "user_id", "visitor_id"]) {
+    if (!session[key]) missing.push(key);
+  }
+  if (!session.csrf_token) missing.push("csrf_token");
+  if (!session.profile_arn) missing.push("profile_arn");
+  return {
+    session,
+    missing,
+    cookieCount: cookies.length,
+    tabUrl: tab?.url || "",
+    csrfSource: extras.csrfSource || ""
+  };
+}
+
+function validateKiroSession(session) {
+  // Schema check used by both the runtime "save" path and the audit.
+  if (!session || typeof session !== "object") return { ok: false, error: "not an object" };
+  const required = ["name", "access_token", "refresh_token", "csrf_token", "user_id", "visitor_id", "profile_arn", "exported_at"];
+  for (const key of required) {
+    if (typeof session[key] !== "string") return { ok: false, error: `${key} must be string` };
+  }
+  if (!session.access_token) return { ok: false, error: "access_token empty" };
+  if (!session.refresh_token) return { ok: false, error: "refresh_token empty" };
+  if (!/^arn:aws:codewhisperer:[a-z0-9-]+:\d+:profile\/[A-Z0-9]+$/.test(session.profile_arn)) {
+    return { ok: false, error: "profile_arn shape invalid" };
+  }
+  if (Number.isNaN(Date.parse(session.exported_at))) return { ok: false, error: "exported_at not ISO" };
+  return { ok: true };
+}
+
+async function readKiroSessions() {
+  const data = await chrome.storage.local.get([KIRO_SESSIONS_KEY]);
+  const list = Array.isArray(data[KIRO_SESSIONS_KEY]) ? data[KIRO_SESSIONS_KEY] : [];
+  return list;
+}
+
+async function saveKiroSession(session) {
+  const valid = validateKiroSession(session);
+  if (!valid.ok) throw new Error(`invalid session: ${valid.error}`);
+  const list = await readKiroSessions();
+  // Replace any record with the same user_id; otherwise prepend.
+  const filtered = list.filter((item) => item.user_id !== session.user_id || !session.user_id);
+  filtered.unshift(session);
+  // Cap at 50 to keep storage bounded.
+  const capped = filtered.slice(0, 50);
+  await chrome.storage.local.set({ [KIRO_SESSIONS_KEY]: capped });
+  return { count: capped.length };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     if (message?.type === "getVaultSnapshot") {
@@ -189,9 +343,47 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
+    if (message?.type === "exportKiroSession") {
+      const result = await buildKiroSessionExport({ name: message.name });
+      sendResponse({ ok: true, ...result });
+      return;
+    }
+
+    if (message?.type === "saveKiroSession") {
+      const result = await saveKiroSession(message.session);
+      sendResponse({ ok: true, ...result });
+      return;
+    }
+
+    if (message?.type === "listKiroSessions") {
+      const list = await readKiroSessions();
+      sendResponse({ ok: true, sessions: list });
+      return;
+    }
+
+    if (message?.type === "deleteKiroSession") {
+      const list = await readKiroSessions();
+      const next = list.filter((item) => item.exported_at !== message.exportedAt);
+      await chrome.storage.local.set({ [KIRO_SESSIONS_KEY]: next });
+      sendResponse({ ok: true, count: next.length });
+      return;
+    }
+
     sendResponse({ ok: false, error: "Unknown message type." });
   })().catch((error) => {
     sendResponse({ ok: false, error: error?.message || String(error) });
   });
   return true;
 });
+
+
+// Exposed for the smoke-test audit. No runtime code reads these; a page
+// context wouldn't see `self.__kiroSessionInternals` anyway since this file
+// is a service worker.
+self.__kiroSessionInternals = {
+  cookieMapToFields,
+  validateKiroSession,
+  KIRO_COOKIE_DOMAINS,
+  KIRO_COOKIE_FIELD_MAP,
+  KIRO_SESSIONS_KEY
+};

@@ -47,6 +47,11 @@ GitHub: username----password----2FA
             <button id="saveFolder" type="button">保存到文件夹</button>
             <button id="exportGoogleCsv" type="button">导出密码 CSV</button>
           </div>
+          <div class="row-2">
+            <button id="exportKiroSession" type="button">导出 Kiro Session</button>
+            <button id="listKiroSessions" type="button" class="ghost">导出所有 Kiro Sessions</button>
+          </div>
+          <div id="kiroSessionsList" class="kiro-sessions" hidden></div>
           <button id="clearSiteData" type="button" class="danger">深度清理当前站点</button>
         </details>
 
@@ -62,6 +67,8 @@ GitHub: username----password----2FA
         </div>
       </section>
     </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
     <dialog id="cleanDialog" class="clean-dialog" aria-labelledby="cleanDialogTitle">
       <form method="dialog" class="clean-form">
